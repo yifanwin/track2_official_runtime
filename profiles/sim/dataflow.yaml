@@ -41,3 +41,20 @@ nodes:
     outputs:
       - env_to_gw
       - robot_to_gw
+
+  # 选手侧：把注入的选手包跑起来，它的 Tool 调用经本节点打官方 gateway。
+  #
+  # ⚠️ 三个设计点：
+  #   1. **没有选手包时它干净空转**（自测模式）—— 节点照样起，只是什么都不做。
+  #      这样「自测」与「评测」用同一份 dataflow，不会出现两套拓扑。
+  #   2. 它**不接 gateway 的 dora 通道** —— 派发走 HTTP。dora 通道是
+  #      provider↔gateway 的专用路径（provider 注册与执行请求），
+  #      不是给「工具调用方」用的。
+  #   3. 它**不依赖物理节点**（不接 `runtime/*`）：选手第一步就是
+  #      `observe()`，走 HTTP 就够，不需要在 dora 里再拉一条边。
+  - id: player
+    path: ${PAOS_SKILL_ROOT}/nodes/run_player.sh
+    inputs:
+      tick: dora/timer/millis/1000
+    outputs:
+      - player_result

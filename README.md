@@ -13,28 +13,41 @@ Track 2 的**唯一 Tool 面**（Q16 单一新轨）。环境怎么提供、反�
 track2_official_runtime/
 ├── skill.yaml                        manifest v2（PAOS 读）
 ├── SKILL.md                          PAOS 硬约束：必须叫这个名字
-├── start.sh                          启动前准备（注入标定环境路径 + 前置检查）
+├── start.sh                          启动前准备 + **注入选手包**（T3-b）
 ├── profiles/sim/
-│   ├── dataflow.yaml                 dora 拓扑：gateway + runtime
+│   ├── dataflow.yaml                 dora 拓扑：gateway + runtime + player
 │   ├── gateway.yaml                  ★ 官方 gateway 配置（**生成物**，见下）
 │   ├── runtime.example.yaml          节点配置模板（可直接用）
-│   └── runtime.yaml                  ⚠️ 裁判私有，**被 .gitignore 忽略**
+│   ├── runtime.yaml                  ⚠️ 裁判私有，**被 .gitignore 忽略**
+│   ├── player/                       ★ 选手包解到这里（每次 start 重建；已忽略）
+│   └── player_work/                  选手沙箱工作区（已忽略）
 └── nodes/
     ├── run_runtime.sh                启动包装（绕开 dora 的 venv 解析问题）
-    └── track2_maniskill_runtime/     ★ provider 节点
-        ├── __main__.py              `python -m` 入口
-        ├── node.py                  dora 主循环 + endpoint.register
-        ├── endpoints.py             官方 ToolEndpoint 实现
-        └── config.py                节点配置
+    ├── run_player.sh                 同上，给 player 节点
+    ├── track2_maniskill_runtime/     ★ provider 节点
+    │   ├── __main__.py              `python -m` 入口
+    │   ├── node.py                  dora 主循环 + endpoint.register
+    │   ├── endpoints.py             官方 ToolEndpoint 实现
+    │   └── config.py                节点配置
+    └── track2_player_node/           ★ 选手侧节点（第 4 步）
+        ├── __main__.py
+        └── node.py                  沙箱起停 + Tool 调用打 gateway
 ```
 
-## 两个节点
+## 三个节点
 
 ```text
 官方 gateway 二进制 ──── /tools + /invocations ────▶ PAOS
         ↕ dora（env_out/env_in、robot_out/robot_in）
 track2-maniskill-runtime ──▶ ManiSkill/SAPIEN 里的 Piper
+
+player ──HTTP──▶ gateway          （把选手沙箱里的 Tool 调用转成 HTTP）
+   └─ 沙箱（选手 entrypoint.py）
 ```
+
+**player 为什么不直连物理**：它只跟 gateway 说话；物理由 runtime 节点提供。
+**player 为什么不走 dora 通道**：dora 通道是 provider↔gateway 的专用路径
+（注册与执行请求），不是给「工具调用方」用的。
 
 | 层 | 谁提供 |
 |---|---|
@@ -105,6 +118,28 @@ export PATH="$HOME/.dora/bin:$PATH"
 dora run dataflow.yaml                   # 在 profile 目录里跑，相对路径才对
 ```
 
+## 选手包注入（第 4 步）
+
+```bash
+TRACK2_PLAYER_PACKAGE=/path/to/player.zip \
+  paos skill start track2-official-runtime --profile sim
+```
+
+* 解到 `profiles/<profile>/player/`，**原子落盘**（校验失败不留半个包）
+* 校验不过 → `start.sh` 非零退出 → **PAOS 中止 start**
+* **不给包时清掉上一轮残留** —— 避免静默复用旧选手包
+* 选手 `manifest.json` 的 `tool_profile` 必须是**列表**且 ⊆ 官方三 Tool
+  （旧字符串形态明确拒绝，Q16）
+
+**两个沙箱档**（由选手 `requires_gpu` 决定）：
+
+| 档 | 内容 | 谁用 |
+|---|---|---|
+| `stdlib`（默认） | 纯标准库、无 GPU、`RLIMIT_AS` 256 MiB | 不带模型的选手 |
+| `official` | 官方 ML runtime（torch + CUDA）、只给 GPU 0、不设内存上限 | 带模型的选手 |
+
+**「允许」不是「要求」**：不带模型的方案走 stdlib 档，一样完整评测。
+
 ## 依赖
 
 节点需要**标定环境**（`../toolenv/.venv`）：Python 3.12 + 官方 `gateway` 二进制 +
@@ -126,6 +161,11 @@ dora run dataflow.yaml                   # 在 profile 目录里跑，相对路�
 | **dora 会写 `out/`** | 运行产物被打进 Bundle | 打包/收尾时 `rm -rf profiles/sim/out` |
 | **provider 的 `context.tool_id` 不是 Tool ID** | `unknown tool 'track2.env'` | `endpoints.py: _TOOL_IDS` 显式映射 |
 | **handler 只在终态事件时推进 phase** | phase 永远停在 `accepted` | 执行体跑完发 `ToolEvent(executor_completed/...)` |
+| **官方 gateway 的 phase 词表与本地不同** | 客户端永远轮询到超时 | `toolapi/client.py` 的 `is_terminal_phase()` 两套都认 |
+| **官方 Query 响应多套一层** | `observe()["robot"]` → `KeyError` | `query_payload()` 归一化 |
+| **官方不转发 `ToolControlResponse.details`** | Q13 三态到不了客户端 | 超时证据改用「phase 已终结」 |
+| **seccomp 的 `clone3` 规则顺序** | `cuda.is_available()==False`（像没插显卡） | `clone3` 只能有一条 `ENOSYS` 规则，不能被 `EPERM` 遮蔽 |
+| **`--pid` 后不挂新 `/proc`** | 同上，`cuInit=304` | `unshare` 加 `--mount-proc` |
 
 ## 路径策略（三条规则，各有理由）
 
@@ -151,7 +191,7 @@ export TRACK2_SEED=0
 
 ## 状态
 
-**第 3 步已完成**（2026-10-16）。
+**第 3–4 步已完成**（2026-10-16）。
 
 | 项 | 状态 |
 |---|---|
@@ -160,7 +200,8 @@ export TRACK2_SEED=0
 | provider 节点（离线自检 23 项全过；端到端经官方 gateway 通） | ✅ |
 | **经官方 gateway 的完整 invoke** | ✅ 见下 |
 | 21 项回归在 3.12 上复核 | ✅ 与 3.10 **零差异** |
-| `paos skill start` 起整条链 | ⏳ 第 3.9 步 |
+| `paos skill start` 起整条链 | ✅ 三条 Tool 全 ready |
+| **选手包注入 + 沙箱起停（第 4 步）** | ✅ 两条档都跑通（stdlib / official+CUDA） |
 
 ### 端到端实测（`work/scripts/e2e_step3.sh --action`）
 

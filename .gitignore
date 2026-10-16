@@ -10,6 +10,11 @@
 # `runtime.yaml` 由评测机按 case 渲染，含 case_id + seed + casebank 路径。
 # 里面的种子值本身不泄漏答案，但它是**每个 case 的评测输入**，不随 Bundle 发布。
 /profiles/*/runtime.yaml
+
+# 选手包注入的目标目录与工作区（第 4 步）—— 每次 start 时由 start.sh 重建，
+# 里面是**选手代码**，绝不能跟着 Bundle 走。
+/profiles/*/player/
+/profiles/*/player_work/
 # 任何按 case 渲染出来的配置
 /profiles/*/*.rendered.yaml
 /case_runtime.yaml
@@ -23,6 +28,9 @@ __pycache__/
 # dora 的 dataflow 运行产物
 /.dora/
 *.dora.log
+# 端到端脚本临时渲染出来的 flow（`.<name>_flow.yaml`）——
+# 它们会被打包脚本扫进去，必须在打包前清掉
+/profiles/*/.*.yaml
 
 # 节点日志
 /logs/

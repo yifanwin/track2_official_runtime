@@ -1,0 +1,353 @@
+"""`track2-player` —— 在沙箱里跑选手包的 dora 节点（第 4 步 / A′-1）。
+
+## 它在链路里的位置
+
+```text
+   evaluator          dora flow（官方 Bundle）
+      │                 ┌────────────────────────────────────────────┐
+      │  start.sh 注入  │  gateway  ◀─ HTTP ─  player ─▶ 沙箱(选手码) │
+      └────────────────▶│     ▲                            │         │
+        profiles/sim/   │     └─ dora ─▶ runtime ◀ 物理 ◀──┘         │
+        player/         └────────────────────────────────────────────┘
+```
+
+* **runtime 节点**提供三个 Tool（本地 provider，经 dora 通道接 gateway）。
+* **player 节点**（本文件）把选手代码跑起来，并把它的 Tool 调用打到 gateway。
+* **gateway** 是官方二进制，负责 `/tools` 与 `/invocations` 路由。
+
+## 为什么不直连 HTTP
+
+沙箱**保留了 `--net`**（自己的网络命名空间），所以沙箱内**连不到宿主上的
+gateway**（实测：`work/scripts/check_sandbox_official.py`）。走既有的 JSON-lines 桥：
+
+```text
+沙箱内 tools.joint_control(q, g)
+  → 协议 stdout/stdin（package_host.py:ToolClient）
+  → 本节点（SandboxBridge → ToolClient(HttpTransport)）
+  → POST http://127.0.0.1:<port>/tools/...:invoke
+  → 官方 gateway → dora 通道 → runtime 节点 → ManiSkill
+```
+
+## 两个沙箱档（Q18）
+
+| `requires_gpu` | 档 | 内容 |
+|---|---|---|
+| `false`（默认） | stdlib | 只有标准库、无 GPU —— 与第 4 步之前**逐字一致** |
+| `true` | official | 官方 ML runtime（torch + CUDA），只给 GPU 0 |
+
+**这是「允许」不是「要求」**：不带模型的选手走 stdlib 档，一样完整评测。
+声明 `requires_gpu=true` 而官方 runtime 不可用时**明确失败**，不静默降级。
+
+## 节点什么时候结束
+
+选手包跑完（或超时/出错）就结束 `run()`。`start.sh` 在**注入阶段**已经校验过
+一次选手包，这里是**第二道**（也是真正执行的那一道）。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pyarrow as pa                                     # noqa: E402
+from dora import Node                                    # noqa: E402
+
+from track2_judge.runner.player_manifest import (        # noqa: E402
+    PlayerManifest, PlayerManifestError, validate_player_dir,
+)
+from track2_judge.runner.skill_manifest import (         # noqa: E402
+    SkillPackage, SkillValidationError,
+)
+from track2_judge.sandbox.package import PackageExecutor  # noqa: E402
+from track2_judge.sandbox.rpc import SecurityNotReady, SkillTimeout  # noqa: E402
+from track2_judge.toolapi.client import (                # noqa: E402
+    HttpTransport, SandboxBridge, ToolCallError, ToolClient,
+)
+
+__all__ = ["PlayerConfig", "PlayerConfigError", "PlayerNode", "main", "start_player"]
+
+# 选手侧方法名 → Tool ID。与 `toolapi/client.py` 的别名表同一套。
+METHOD_TO_TOOL = {
+    "observe": "track2.env.observe",
+    "joint_control": "track2.robot.joint_control",
+    "step": "track2.robot.joint_control",
+    "piper_joint_control": "track2.robot.joint_control",
+    "gripper_control": "track2.robot.gripper_control",
+    "piper_gripper_control": "track2.robot.gripper_control",
+}
+
+
+class PlayerConfigError(RuntimeError):
+    """配置/环境不满足 —— **不降级、宁可不起**。"""
+
+
+class PlayerConfig:
+    """运行参数。全部来自环境（由 `skill.yaml` 的 `environment` 或 start.sh 注入）。"""
+
+    def __init__(self, env: dict[str, str] | None = None) -> None:
+        env = os.environ if env is None else env
+        self.profile = (env.get("PAOS_SKILL_PROFILE") or "sim").strip() or "sim"
+        self.bundle_root = Path(env.get("PAOS_SKILL_ROOT") or ".").expanduser()
+        self.gateway_url = (env.get("TRACK2_GATEWAY_URL")
+                            or "http://127.0.0.1:19110").strip()
+        default_player = self.bundle_root / "profiles" / self.profile / "player"
+        self.player_dir = Path(
+            env.get("TRACK2_PLAYER_DIR") or default_player).expanduser()
+        self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 600)
+        self.tool_call_budget = int(env.get("TRACK2_TOOL_CALL_BUDGET") or 2400)
+        self.action_timeout_s = float(env.get("TRACK2_ACTION_TIMEOUT_S") or 30)
+        self.mode = (env.get("TRACK2_MODE") or "final").strip() or "final"
+        # 等 gateway + provider 注册就绪的上限（建场景要几十秒）
+        self.ready_timeout_s = float(env.get("TRACK2_PLAYER_READY_TIMEOUT_S") or 300)
+
+    @property
+    def gateway_port(self) -> int:
+        from urllib.parse import urlparse
+        return urlparse(self.gateway_url).port or 80
+
+
+class ProfileGatedBridge(SandboxBridge):
+    """在 `SandboxBridge` 上再加一道「选手**声明过**的 Tool 集合」门禁。
+
+    为什么 Gateway 之外还要这一层：两者的 allowlist 不是一回事 ——
+      * Gateway 的来自 Bundle 的 `required_tools`（**官方全集**）；
+      * 这里的是选手 `tool_profile`（**本人子集**）。
+    两层的关系是「全集」与「子集」，都在调用路径上，缺一不可。
+    """
+
+    def __init__(self, client: ToolClient, allowed: tuple[str, ...]) -> None:
+        super().__init__(client)
+        self.allowed = frozenset(allowed)
+
+    def __call__(self, method: str, payload: dict | None = None):
+        tool_id = METHOD_TO_TOOL.get(method, method)
+        if tool_id not in self.allowed:
+            raise ToolCallError(
+                f"tool {tool_id!r} is not declared in this skill's tool_profile "
+                f"({', '.join(sorted(self.allowed))})")
+        return super().__call__(method, payload)
+
+
+class PlayerNode:
+    """dora 节点。**没有选手包时干净空转**（自测模式）。"""
+
+    def __init__(self, config: PlayerConfig) -> None:
+        self.config = config
+        self.node = Node()
+        self.manifest: PlayerManifest | None = None
+        self.summary: dict[str, Any] = {"status": "not_started"}
+
+    # ── 准备
+
+    def prepare(self) -> None:
+        root = self.config.player_dir
+        if not root.is_dir():
+            self.summary = {"status": "no_player",
+                            "reason": f"no contestant package at {root}"}
+            print(f"[track2-player] 没有选手包（{root}）—— 节点空转。",
+                  file=sys.stderr, flush=True)
+            return
+        try:
+            self.manifest = validate_player_dir(root, where="player node")
+        except PlayerManifestError as exc:
+            self.summary = {"status": "rejected", "reason": str(exc)}
+            print(f"[track2-player] 选手包被拒：{exc}", file=sys.stderr, flush=True)
+            return
+        print(f"[track2-player] 选手包 OK skill={self.manifest.skill_name} "
+              f"entrypoint={self.manifest.relative_entrypoint} "
+              f"tools={','.join(self.manifest.tool_profile)} "
+              f"gpu={'yes' if self.manifest.requires_gpu else 'no'}",
+              file=sys.stderr, flush=True)
+
+    # ── 沙箱档
+
+    def _sandbox_spec(self, manifest: PlayerManifest):
+        from track2_judge.sandbox.official_runtime import (
+            RuntimeSpecError, check_official_runtime, official_spec,
+        )
+
+        if not manifest.requires_gpu:
+            # 严格档 —— 与第 4 步之前逐字一致（21 项回归跑的就是它）
+            from track2_judge.sandbox.runtime import prepare_runtime
+            from track2_judge.sandbox.official_runtime import stdlib_spec
+            return stdlib_spec(prepare_runtime()), "stdlib"
+
+        try:
+            spec = official_spec(gateway_port=self.config.gateway_port)
+        except RuntimeSpecError as exc:
+            raise PlayerConfigError(
+                "contestant package declares requires_gpu=true but the official "
+                f"runtime is unavailable: {exc}") from exc
+        problems = check_official_runtime(spec)
+        if problems:
+            raise PlayerConfigError(
+                "contestant package declares requires_gpu=true but the GPU sandbox "
+                "cannot be provided: " + "; ".join(problems))
+        return spec, "official"
+
+    # ── 等 gateway 就绪
+
+    def wait_ready(self, timeout_s: float | None = None) -> bool:
+        """轮询 `GET /tools` 直到 200。
+
+        **必须有这一步**：`runtime` 节点建场景（ManiSkill/SAPIEN）要几十秒，
+        而 player 节点几乎是立刻起来的。不等就调 `observe()` 会拿到
+        `TRACK2_SCENE_NOT_READY` —— 看起来像「选手代码有问题」。
+
+        另外，`/tools` 返回 200 只说明 gateway 起来了；
+        runtime 是否注册成功看 `revision`（`endpoint.register` 被接受后才会 > 0）。
+        """
+        import urllib.error
+        import urllib.request
+
+        deadline = time.monotonic() + (timeout_s if timeout_s is not None
+                                       else self.config.ready_timeout_s)
+        url = self.config.gateway_url + "/tools"
+        last = "no attempt"
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                revision = (body.get("data") or {}).get("revision")
+                if revision:
+                    print(f"[track2-player] gateway 就绪 revision={revision}",
+                          file=sys.stderr, flush=True)
+                    return True
+                last = f"revision={revision!r}"
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                last = f"{type(exc).__name__}: {str(exc)[:80]}"
+            time.sleep(2.0)
+        print(f"[track2-player] gateway 等待超时（{last}）", file=sys.stderr, flush=True)
+        return False
+
+    # ── 跑一个 episode
+
+    def run_episode(self, observation: dict | None = None) -> dict[str, Any]:
+        assert self.manifest is not None
+        manifest = self.manifest
+        work = (self.config.bundle_root / "profiles" / self.config.profile
+                / "player_work")
+        work.mkdir(parents=True, exist_ok=True)
+
+        try:
+            package = SkillPackage(manifest.root)
+        except (SkillValidationError, ValueError) as exc:
+            raise PlayerConfigError(f"skill package rejected: {exc}") from exc
+
+        spec, sandbox_profile = self._sandbox_spec(manifest)
+        print(f"[track2-player] 沙箱档 = {sandbox_profile}", file=sys.stderr, flush=True)
+
+        client = ToolClient(
+            HttpTransport(self.config.gateway_url, timeout_s=30.0),
+            action_timeout_s=self.config.action_timeout_s,
+            max_action_steps=self.config.tool_call_budget,
+        )
+        bridge = ProfileGatedBridge(client, manifest.tool_profile)
+
+        status = "ok"
+        skill_result: dict[str, Any] = {}
+        lifecycle: list[str] = []
+        executor = PackageExecutor(package, work, isolated=True, trusted=False,
+                                   timeout_s=self.config.timeout_s, spec=spec)
+        try:
+            executor.initialize({
+                "skill_api_version": manifest.api_version,
+                "mode": self.config.mode,
+                "environment": self.config.profile,
+                "tool_call_budget": self.config.tool_call_budget,
+                # 沙箱档是**运行事实**，选手需要知道自己的模型能不能上 GPU。
+                # 它不含任何裁判私有信息。
+                "sandbox": {"profile": sandbox_profile,
+                            "gpu": bool(manifest.requires_gpu)},
+            })
+            try:
+                skill_result = executor.run(
+                    observation or {}, bridge,
+                    timeout_s=self.config.timeout_s,
+                    max_requests=self.config.tool_call_budget)
+            except SkillTimeout:
+                status = "timeout"
+        except SecurityNotReady as exc:
+            status = "security_not_ready"
+            skill_result = {"error": str(exc)}
+        finally:
+            lifecycle = list(executor.lifecycle)
+            executor.close()
+
+        return {
+            "status": status,
+            "skill": manifest.skill_name,
+            "sandbox_profile": sandbox_profile,
+            "tool_calls": len(bridge.calls),
+            "lifecycle": lifecycle,
+            "result": skill_result,
+        }
+
+    # ── 主循环
+
+    def run(self) -> int:
+        self.prepare()
+        if self.manifest is not None:
+            try:
+                if not self.wait_ready():
+                    raise PlayerConfigError(
+                        f"gateway at {self.config.gateway_url} never became ready")
+                self.summary = self.run_episode()
+            except (PlayerConfigError, OSError, ValueError, RuntimeError) as exc:
+                self.summary = {"status": "error",
+                                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                                "skill": self.manifest.skill_name}
+                # ⚠️ 打印**完整**回溯。只打 `str(exc)` 会得到
+                #    `package execution/protocol rejected` 这种
+                #    来自协议层的笼统消息，真正的根因（HTTP 失败、
+                #    物理拒绝、超时）就丢了 —— 白绕一轮。
+                import traceback
+                print("[track2-player] " + traceback.format_exc(),
+                      file=sys.stderr, flush=True)
+            # 摘要一行（不含 result，避免刷屏）
+            print("[track2-player] 结束：" +
+                  json.dumps({k: v for k, v in self.summary.items() if k != "result"},
+                             ensure_ascii=False), file=sys.stderr, flush=True)
+            # 选手返回的东西单独打，**有界**截断 —— 它是选手自己写的，
+            # 可能很大，但正是排查时最需要看的。
+            skill_result = self.summary.get("result")
+            if skill_result:
+                text = json.dumps(skill_result, ensure_ascii=False, default=str)
+                print("[track2-player] 选手返回：" + text[:8000],
+                      file=sys.stderr, flush=True)
+            self._emit(self.summary)
+
+        # dora 节点要**持续消费输入**，否则上游发消息会阻塞。
+        for event in self.node:
+            if event["type"] == "STOP":
+                break
+        return 0
+
+    def _emit(self, payload: dict[str, Any]) -> None:
+        """把结果发到 `player_result` 输出通道（没有下游时静默忽略）。"""
+        try:
+            self.node.send_output(
+                "player_result",
+                pa.array([json.dumps(payload, ensure_ascii=False, default=str)]))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def start_player(config: PlayerConfig | None = None) -> int:
+    return PlayerNode(config or PlayerConfig()).run()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Track 2 contestant player node")
+    parser.add_argument("--config", default=None,
+                        help="保留位（与 runtime 节点的 CLI 形状一致）")
+    parser.parse_args()
+    return start_player()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
