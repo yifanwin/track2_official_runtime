@@ -1,16 +1,20 @@
-# track2-maniskill-runtime 的配置**模板**。
+# track2-maniskill-runtime 的配置。
 #
-# ⚠️ 评测机按 case 渲染出 `runtime.yaml`（本文件被 .gitignore 忽略），
-#    因为它含 case_id + seed —— 那是**每个 case 的评测输入**，不随 Bundle 发布。
+# **case_id 与 seed 走环境变量**（`TRACK2_CASE_ID` / `TRACK2_SEED`），
+# 因为它们是**每个 case 的评测输入**，不该固化进 Bundle —— 否则换个 case
+# 就得重新打包。这里留的值只是**调试默认值**。
 #
-# 本模板可用来手工起一条链路做调试：
-#   cp runtime.example.yaml runtime.yaml
-#
-# 调试时 casebank 用相对配置目录的路径；评测机渲染时给绝对路径。
+# 评测机注入方式（任选其一）：
+#   * `skill.yaml` 的 `profiles.<p>.environment`
+#   * 启动前 `export TRACK2_CASE_ID=xxx TRACK2_SEED=0`
 
 case_id: 001_real_world_images__real_image_1
 seed: 0
-casebank: ../../../track2_final/judge_private/casebank
+
+# 相对路径按 `TRACK2_PHYSICS_ROOT` 解析（不是按本文件所在目录）——
+# 因为 PAOS 的 installer 会把 profile 文件软链到另一个位置，
+# 从那里往上推是错的。绝对路径照常。
+casebank: judge_private/casebank      # 相对 TRACK2_PHYSICS_ROOT
 
 # episode 预算 —— 与评测器 runner 的语义一致
 max_steps: 2400

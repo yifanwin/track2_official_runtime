@@ -5,7 +5,7 @@
 # 选手不允许修改它。
 manifest_version: 2
 name: track2-official-runtime
-version: "0.1.0"
+version: "0.1.2"
 description: Track 2 official ManiSkill Tool runtime (observe / joint_control / gripper_control).
 skill_document: SKILL.md
 
@@ -26,12 +26,15 @@ profiles:
       - gateway
     required_assets: []
     required_environment: []
+    # 只放**机器相关**的绝对路径 —— 这两个在 install 时不会变。
+    #
+    # ⚠️ 不要在这里放 `nodes/` 的路径：install 之后 Bundle 被搬到
+    #    `$HOME/.PhyAgentOS/skills/<name>/`，`nodes/` 也跟着走。
+    #    `run_runtime.sh` 自己算它（`$0` 就在那里），所以这里只给标定环境
+    #    与物理侧源码树这两个**不在 Bundle 内**的位置。
     environment:
-      # dataflow.yaml 里的 ${TRACK2_PYTHON} / ${TRACK2_PYTHONPATH} 从这里展开。
-      # 标定环境：3.12，同时承载 Tool 面与物理侧
-      # （见 work/reports/52_tool_surface_decision.md）
       TRACK2_PYTHON: /mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/toolenv/.venv/bin/python
-      TRACK2_PYTHONPATH: /mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/track2_final:/mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/track2_official_runtime/nodes
+      TRACK2_PHYSICS_ROOT: /mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/track2_final
 
 artifacts:
   resolver: registry

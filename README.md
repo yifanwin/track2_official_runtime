@@ -115,13 +115,39 @@ dora run dataflow.yaml                   # 在 profile 目录里跑，相对路�
 
 ## 已知的坑（都踩过）
 
+完整的台账在 `../work/reports/54_pitfalls.md`（按 PAOS 打包 / dora / forge_tool / 环境 分类）。
+**最容易再踩的六条**：
+
 | 坑 | 现象 | 解法 |
 |---|---|---|
-| **dora 解析 venv 符号链接** | `No module named 'pyarrow'` | 用 `nodes/run_runtime.sh` 包一层 |
-| **`./run.sh` 不能直接当 `path:`** | daemon 把它当 py 文件喂给 python | `path:` 必须指向**可执行文件**（脚本或解释器绝对路径） |
-| **provider 的 `context.tool_id` 不是 Tool ID** | schema 校验报 `unknown tool 'track2.env'` | 边界上显式映射，见 `endpoints.py: _TOOL_IDS` |
-| **`image_stale_after_sec` 不能是 null** | 官方 config 解析拒绝 | 省略该键（`require_images: false` 时它不参与判定） |
-| **端口 19110 被占** | `address already in use` | 上一次 gateway 没退干净；`pkill -f "gateway --config"` |
+| **同版本号 → install 空转** | 改了代码但行为没变，也不报错 | bump `skill.yaml` 的 `version`；用 `work/scripts/pack_bundle.sh` |
+| **`path:` 不展开任意环境变量** | daemon 找不到解释器 | 用 `nodes/run_runtime.sh` 包一层 |
+| **daemon 解析 venv 符号链接** | `No module named 'pyarrow'` | 同上（venv 识别交给 python 自己） |
+| **dora 会写 `out/`** | 运行产物被打进 Bundle | 打包/收尾时 `rm -rf profiles/sim/out` |
+| **provider 的 `context.tool_id` 不是 Tool ID** | `unknown tool 'track2.env'` | `endpoints.py: _TOOL_IDS` 显式映射 |
+| **handler 只在终态事件时推进 phase** | phase 永远停在 `accepted` | 执行体跑完发 `ToolEvent(executor_completed/...)` |
+
+## 路径策略（三条规则，各有理由）
+
+改动这几个文件时最容易搞混：
+
+| 项 | 怎么定 | 为什么 |
+|---|---|---|
+| `TRACK2_PYTHON` / `TRACK2_PHYSICS_ROOT` | `skill.yaml` 的 `environment`，**绝对路径** | 它们在 Bundle **外**，install 时不变 |
+| `nodes/` 的路径 | `run_runtime.sh` 用 `$0` **自己算** | install 后 Bundle 被搬走，`nodes/` 跟着走 |
+| `casebank` | YAML 写**相对路径**，相对 `TRACK2_PHYSICS_ROOT` | installer 会把 profile 文件软链到别处，**不能**按配置文件目录推 |
+
+## `case_id` / `seed` 走环境变量
+
+它们是**每个 case 的评测输入**，不该固化进 Bundle（否则换个 case 就得重打包）。
+
+```bash
+export TRACK2_CASE_ID=016_synthetic_images__scene_image_2
+export TRACK2_SEED=0
+```
+
+`runtime.yaml` 里留的值只是**调试默认值**。
+评测机通过 `skill.yaml` 的 `profiles.<p>.environment` 或启动前 export 注入。
 
 ## 状态
 

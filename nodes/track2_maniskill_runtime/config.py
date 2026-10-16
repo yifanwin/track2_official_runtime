@@ -98,14 +98,36 @@ def load_config(config_path: str | Path | None = None) -> RuntimeConfig:
     if unknown:
         raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
 
+    # ── case_id / seed：**环境变量优先**
+    #
+    # 它们是**每个 case 的评测输入**，不该固化进 Bundle（否则换个 case 就得重打包）。
+    # 评测机通过 `skill.yaml` 的 `profiles.<p>.environment` 或 start.sh 注入：
+    #   TRACK2_CASE_ID / TRACK2_SEED
+    # YAML 里只留一个**调试用**的默认值。
+    if os.environ.get("TRACK2_CASE_ID", "").strip():
+        data["case_id"] = os.environ["TRACK2_CASE_ID"].strip()
+    if os.environ.get("TRACK2_SEED", "").strip():
+        try:
+            data["seed"] = int(os.environ["TRACK2_SEED"])
+        except ValueError:
+            raise ConfigError("TRACK2_SEED must be an integer") from None
+
     for required in ("case_id", "casebank"):
         if required not in data:
             raise ConfigError(f"missing required config key: {required}")
 
     casebank = Path(str(data["casebank"])).expanduser()
     if not casebank.is_absolute():
-        # 相对路径按**配置文件所在目录**解析，与 dataflow 的惯例一致
-        casebank = (path.parent / casebank).resolve()
+        # ⚠️ 相对路径**不能**按配置文件所在目录解析 —— PAOS 的 installer 会把
+        # profile 文件软链到 `.../environments/<skill>/<profile>/<digest>/launch/profiles/...`
+        # 下，从那里往上推是错的（实测过：算出 `.../sim/<digest>/track2_final/...`）。
+        #
+        # 改为按 `TRACK2_PHYSICS_ROOT` 解析 —— 它是**机器相关的绝对路径**，
+        # 由 `skill.yaml` 的 `profiles.<name>.environment` 注入，
+        # 与 Bundle 被搬到哪里无关。没给就退回配置文件目录（手工跑的场景）。
+        physics_root = os.environ.get("TRACK2_PHYSICS_ROOT")
+        base = Path(physics_root).expanduser() if physics_root else path.parent
+        casebank = (base / casebank).resolve()
 
     kwargs = {k: v for k, v in data.items() if k in _KEYS}
     kwargs["casebank"] = casebank

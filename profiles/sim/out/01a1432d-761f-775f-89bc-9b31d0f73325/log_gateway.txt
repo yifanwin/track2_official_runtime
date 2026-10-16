@@ -1,8 +1,0 @@
-INFO:     Started server process [3147455]
-INFO:     Uvicorn running on http://127.0.0.1:19110 (Press CTRL+C to quit)
-2026-10-16 13:26:59 - forge_gateway.cli - INFO - gateway serving http/ws on 127.0.0.1:19110
-INFO:     127.0.0.1:49816 - "GET /tools HTTP/1.1" 200 OK
-INFO:     127.0.0.1:49818 - "GET /tools HTTP/1.1" 200 OK
-INFO:     127.0.0.1:45000 - "GET /tools HTTP/1.1" 200 OK
-INFO:     127.0.0.1:45008 - "GET /tools HTTP/1.1" 200 OK
-2026-10-16 13:27:05 - forge_gateway.cli - INFO - gateway received signal 15
