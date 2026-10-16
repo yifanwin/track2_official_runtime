@@ -1,0 +1,48 @@
+# Track 2 官方 Tool Runtime —— manifest v2
+#
+# 这个 Bundle 是**唯一的 Tool 面**（Q16 单一新轨）：
+# 环境怎么提供、反馈什么、机器人怎么控制，全部经这里的三个 Tool。
+# 选手不允许修改它。
+manifest_version: 2
+name: track2-official-runtime
+version: "0.1.0"
+description: Track 2 official ManiSkill Tool runtime (observe / joint_control / gripper_control).
+skill_document: SKILL.md
+
+# 官方 gateway 的监听地址。节点起来之前 PAOS 会探测它。
+gateway_url: http://127.0.0.1:19110
+
+# 与 track2_final/track2_judge/toolapi/schema.py 的 REQUIRED_TOOLS 一致。
+# 改这里必须改 schema.py，并重新跑 work/scripts/gen_gateway_yaml.py。
+required_tools:
+  - track2.env.observe
+  - track2.robot.joint_control
+  - track2.robot.gripper_control
+
+profiles:
+  sim:
+    dataflow: profiles/sim/dataflow.yaml
+    required_binaries:
+      - gateway
+    required_assets: []
+    required_environment: []
+    environment:
+      # dataflow.yaml 里的 ${TRACK2_PYTHON} / ${TRACK2_PYTHONPATH} 从这里展开。
+      # 标定环境：3.12，同时承载 Tool 面与物理侧
+      # （见 work/reports/52_tool_surface_decision.md）
+      TRACK2_PYTHON: /mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/toolenv/.venv/bin/python
+      TRACK2_PYTHONPATH: /mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/track2_final:/mnt/SSD_3TB/jusheng/track2_maniskill_staging_20261010/wenyifan/track2_official_runtime/nodes
+
+artifacts:
+  resolver: registry
+  nodes:
+    # 官方 gateway 二进制，已在本机 paos_home 里装好
+    # （`gateway-1.0.2-linux-x86_64-tar-gz`，sha256 取自 Registry）
+    gateway:
+      artifact_id: gateway-1.0.2-linux-x86_64-tar-gz
+      version: "1.0.2"
+      platform: linux
+      arch: x86_64
+      artifact_type: executable_tar_gz
+      entrypoint: gateway
+      sha256: "07584846f16012c6137b10cf743073cd2fe9a7f64564ba2322a7090e66fd3076"

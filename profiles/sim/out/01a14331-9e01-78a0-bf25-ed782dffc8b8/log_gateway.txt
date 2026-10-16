@@ -1,0 +1,18 @@
+INFO:     Started server process [3190530]
+INFO:     Uvicorn running on http://127.0.0.1:19110 (Press CTRL+C to quit)
+2026-10-16 13:31:31 - forge_gateway.cli - INFO - gateway serving http/ws on 127.0.0.1:19110
+INFO:     127.0.0.1:50796 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50808 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50816 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50832 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43686 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43688 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43692 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43706 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43716 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43730 - "POST /tools/track2.robot.joint_control%3Ainvoke HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:43736 - "GET /invocations/gateway-179c837aff27409d9ab618edc40051f5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43748 - "GET /invocations/gateway-179c837aff27409d9ab618edc40051f5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43764 - "GET /invocations/gateway-179c837aff27409d9ab618edc40051f5/result HTTP/1.1" 200 OK
+2026-10-16 13:31:45 - forge_gateway.cli - INFO - gateway received signal 15
+2026-10-16 13:31:45 - forge_gateway.cli - INFO - gateway received signal 15

@@ -1,0 +1,28 @@
+# track2-maniskill-runtime 的配置**模板**。
+#
+# ⚠️ 评测机按 case 渲染出 `runtime.yaml`（本文件被 .gitignore 忽略），
+#    因为它含 case_id + seed —— 那是**每个 case 的评测输入**，不随 Bundle 发布。
+#
+# 本模板可用来手工起一条链路做调试：
+#   cp runtime.example.yaml runtime.yaml
+#
+# 调试时 casebank 用相对配置目录的路径；评测机渲染时给绝对路径。
+
+case_id: 001_real_world_images__real_image_1
+seed: 0
+casebank: ../../../track2_final/judge_private/casebank
+
+# episode 预算 —— 与评测器 runner 的语义一致
+max_steps: 2400
+max_sim_time_s: 120.0
+
+# Action 治理（Q9 / Q12 / Q14）
+max_concurrency: 1              # Q9：关节控制天然串行
+action_timeout_s: 30.0          # Q14 待 73 case 实测，当前是保守占位值
+stop_confirm_timeout_s: 5.0     # Q13：「等 backend 确认真实停止」的上限
+
+# 观测：第 5 步启用正式相机前，模式 B 的参考图还拿不到（当前 camera_status=NOT CONFIGURED）
+camera_required: false
+
+# provider 注册续租间隔（必须小于 gateway.yaml 的 lease_ttl_ms=15000）
+lease_renew_interval_s: 5.0

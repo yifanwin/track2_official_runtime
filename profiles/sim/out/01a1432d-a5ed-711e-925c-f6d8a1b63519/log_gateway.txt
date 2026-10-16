@@ -1,0 +1,28 @@
+{"timestamp":"2026-10-16T05:27:11.255481Z","level":"INFO","fields":{"message":"","name":"MeterProvider.GlobalSet","message":"Global meter provider is set. Meters can now be created using global::meter() or global::meter_with_scope()."},"target":"opentelemetry"}
+INFO:     Started server process [3147886]
+INFO:     Uvicorn running on http://127.0.0.1:19110 (Press CTRL+C to quit)
+2026-10-16 13:27:11 - forge_gateway.cli - INFO - gateway serving http/ws on 127.0.0.1:19110
+INFO:     127.0.0.1:40342 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40354 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40368 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40382 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40394 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40404 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40416 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40418 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40422 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40438 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40452 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40468 - "POST /tools/track2.robot.joint_control%3Ainvoke HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:40100 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40108 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40120 - "GET /tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40130 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40150 - "GET /invocations/gateway-61fddec0dc924323a539bc1c2494cb70 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40162 - "GET /invocations/gateway-61fddec0dc924323a539bc1c2494cb70 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40174 - "GET /invocations/gateway-61fddec0dc924323a539bc1c2494cb70/result HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40138 - "POST /tools/track2.env/observe%3Ainvoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40176 - "POST /tools/track2.robot.joint_control%3Ainvoke HTTP/1.1" 202 Accepted
+2026-10-16 13:27:22 - forge_gateway.cli - INFO - gateway received signal 15
+2026-10-16 13:27:22 - forge_gateway.cli - INFO - gateway received signal 15
+2026-10-16 13:27:22 - forge_gateway.cli - INFO - gateway Dora loop exited: eof

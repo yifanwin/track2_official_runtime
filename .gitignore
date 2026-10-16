@@ -1,0 +1,69 @@
+# Track 2 官方 Tool Runtime —— 忽略规则
+#
+# 原则：
+#   1. **裁判私有输入不进 git**（case_id / seed / casebank 路径）
+#   2. 运行时产物不进 git（缓存、日志、__pycache__）
+#   3. 契约文件**必须**进 git（gateway.yaml 的 specs、dataflow、skill.yaml）
+
+# ─────────────────────────────────────────── ★ 裁判私有
+
+# `runtime.yaml` 由评测机按 case 渲染，含 case_id + seed + casebank 路径。
+# 里面的种子值本身不泄漏答案，但它是**每个 case 的评测输入**，不随 Bundle 发布。
+/profiles/*/runtime.yaml
+# 任何按 case 渲染出来的配置
+/profiles/*/*.rendered.yaml
+/case_runtime.yaml
+
+# ─────────────────────────────────────────── 运行时产物
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# dora 的 dataflow 运行产物
+/.dora/
+*.dora.log
+
+# 节点日志
+/logs/
+*.log
+
+# 虚拟环境（标定环境在 ../toolenv，不在这个仓库里）
+.venv/
+venv/
+env/
+
+# ─────────────────────────────────────────── Python / 工具
+
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# ─────────────────────────────────────────── 编辑器 / 系统
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─────────────────────────────────────────── 不进版本控制但**必须存在**的
+#
+#   skill.yaml                     manifest v2（name/version 必须与目录名一致）
+#   SKILL.md                       PAOS 硬约束：必须叫这个名字
+#   start.sh                       启动前准备（注入标定环境路径）
+#   profiles/sim/dataflow.yaml     dora 拓扑
+#   profiles/sim/gateway.yaml      官方 gateway 配置；specs 由 gen_gateway_yaml.py 生成
+#   nodes/track2_maniskill_runtime/  provider 节点实现
+#
+# ⚠️ profiles/sim/gateway.yaml 是**生成物**，但刻意提交：
+#    它是 Bundle 运行所必需，且其内容必须与 track2_judge/toolapi/schema.py 一致。
+#    一致性由 `work/scripts/gen_gateway_yaml.py --check` 把关。

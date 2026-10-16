@@ -1,0 +1,43 @@
+# Track 2 官方 Tool Runtime —— dora dataflow
+#
+# 两个节点：
+#   gateway  ← 官方 gateway 二进制，提供 PAOS 要的 /tools + /invocations
+#   runtime  ← 我们自研的 provider，驱动 ManiSkill/SAPIEN 里的 Piper
+#
+# 通道方向（**容易搞反**）：gateway.yaml 里 provider 的
+#   input_id  = gateway 的**输入**端口 ← 收 provider 的应答（register/response/event）
+#   output_id = gateway 的**输出**端口 → 发给 provider 的请求（invoke/status/result/control）
+# 所以：
+#   gateway.yaml: input_id=env_in   → dataflow: gateway.inputs.env_in  : runtime/env_to_gw
+#   gateway.yaml: output_id=env_out → dataflow: runtime.inputs.env_from_gw : gateway/env_out
+nodes:
+  - id: gateway
+    path: ${FORGE_RUNTIME_BIN}/gateway
+    args: --config gateway.yaml
+    inputs:
+      tick: dora/timer/millis/500
+      env_in: runtime/env_to_gw
+      robot_in: runtime/robot_to_gw
+    outputs:
+      - tool_response
+      - env_out
+      - robot_out
+
+  # 自研 provider：ManiSkill/SAPIEN 里的 Piper。
+  #
+  # `path:` 用的是**包装脚本**，不是解释器 —— 两个原因：
+  #   1. dora 的 `path:` 只做 `${FORGE_RUNTIME_BIN}` / `${PAOS_SKILL_ROOT}` 两种
+  #      字符串替换（PAOS installer 里写死的那几个），**不展开任意环境变量**；
+  #   2. daemon 会把解释器路径解析成 readlink 后的真路径，uv 建的 venv 会因此
+  #      丢掉 site-packages（报 `No module named 'pyarrow'`）。
+  # 包装脚本里自己读 `TRACK2_PYTHON`（由 skill.yaml 的 profile.environment 注入）。
+  - id: runtime
+    path: ${PAOS_SKILL_ROOT}/nodes/run_runtime.sh
+    args: --config runtime.yaml
+    inputs:
+      tick: dora/timer/millis/1000
+      env_from_gw: gateway/env_out
+      robot_from_gw: gateway/robot_out
+    outputs:
+      - env_to_gw
+      - robot_to_gw

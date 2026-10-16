@@ -1,0 +1,214 @@
+# 本文件由 work/scripts/gen_gateway_yaml.py 生成 —— 不要手改。
+# 源：track2_final/track2_judge/toolapi/schema.py
+#
+# ToolSpec 必须与 schema.py 逐字节一致，否则 PAOS 会在绑定时报
+# `ToolSpec changed after AgentTask binding`。改 spec 请改 schema.py 再重新生成。
+host: 127.0.0.1
+port: 19110
+joint_order: []
+image_input_ids: []
+agent:
+  enabled: false
+  action_manifests: []
+tools:
+  enabled: true
+  lease_ttl_ms: 15000
+  invoke_timeout_ms: 30000
+  invocation_capacity: 64
+  event_capacity: 32
+  retention_sec: 120.0
+  request_input_id: tool_request
+  response_output_id: tool_response
+  providers:
+  - endpoint_id: track2.env
+    input_id: env_in
+    output_id: env_out
+  - endpoint_id: track2.robot
+    input_id: robot_in
+    output_id: robot_out
+  specs:
+  - tool_id: track2.env.observe
+    implementation_id: track2.runtime
+    endpoint_id: track2.env
+    operation: observe
+    semantics: query
+    description: 'Read the approved current observation: robot proprioception, control clock, and the
+      policy camera frame when RGB is requested.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        include_rgb:
+          type: boolean
+          default: true
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - observation_id
+      - captured_at_s
+      - sim_time_s
+      - control_steps
+      - robot
+      properties:
+        observation_id:
+          type: string
+        captured_at_s:
+          type: number
+        sim_time_s:
+          type: number
+        control_steps:
+          type: integer
+          minimum: 0
+        robot:
+          type: object
+          additionalProperties: false
+          required:
+          - joint_position
+          - joint_velocity
+          properties:
+            joint_position:
+              type: array
+              items:
+                type: number
+              minItems: 8
+              maxItems: 8
+            joint_velocity:
+              type: array
+              items:
+                type: number
+              minItems: 8
+              maxItems: 8
+            joint_limits_rad:
+              type: array
+            tcp_position_m:
+              type: array
+              items:
+                type: number
+              minItems: 3
+              maxItems: 3
+            tcp_quaternion_wxyz:
+              type: array
+              items:
+                type: number
+              minItems: 4
+              maxItems: 4
+        task_inputs:
+          type: object
+        images:
+          type: object
+          additionalProperties: false
+          properties:
+            first_frame:
+              type: object
+              additionalProperties: false
+              required:
+              - mime_type
+              - width
+              - height
+              - data_base64
+              - sha256
+              properties:
+                mime_type:
+                  const: image/png
+                width:
+                  type: integer
+                  minimum: 1
+                  maximum: 512
+                height:
+                  type: integer
+                  minimum: 1
+                  maximum: 512
+                data_base64:
+                  type: string
+                sha256:
+                  type: string
+                source:
+                  type: string
+            camera_status:
+              type: string
+    readiness: []
+    robot_frame_profile: &id001
+      robot_id: piper
+      base_frame: arm_base
+      tool_frame: tcp
+      frames: {}
+      directions:
+        forward:
+          frame: arm_base
+          axis: x
+          sign: 1
+  - tool_id: track2.robot.joint_control
+    implementation_id: track2.runtime
+    endpoint_id: track2.robot
+    operation: joint_control
+    semantics: action
+    description: Command one joint position target plus gripper opening. The physical effect completes
+      when the Action terminates.
+    input_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - joint_position
+      - gripper_opening_m
+      properties:
+        joint_position:
+          type: array
+          items:
+            type: number
+          minItems: 6
+          maxItems: 6
+        gripper_opening_m:
+          type: number
+          minimum: 0
+          maximum: 0.1
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - control_steps
+      - sim_time_s
+      properties:
+        control_steps:
+          type: integer
+          minimum: 1
+        sim_time_s:
+          type: number
+    readiness: []
+    robot_frame_profile: *id001
+  - tool_id: track2.robot.gripper_control
+    implementation_id: track2.runtime
+    endpoint_id: track2.robot
+    operation: gripper_control
+    semantics: action
+    description: Command the gripper opening only, holding the arm at its current joint target.
+    input_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - gripper_opening_m
+      properties:
+        gripper_opening_m:
+          type: number
+          minimum: 0
+          maximum: 0.1
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - control_steps
+      - sim_time_s
+      properties:
+        control_steps:
+          type: integer
+          minimum: 1
+        sim_time_s:
+          type: number
+    readiness: []
+    robot_frame_profile: *id001
+readiness:
+  require_proprio_state: false
+  require_images: false
+  require_state_client: false
+  require_image_client: false
+  proprio_stale_after_sec: null
