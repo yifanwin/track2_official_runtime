@@ -28,8 +28,10 @@ metadata: {"PhyAgentOS":{"always":true,"requires":{"runtime":["track2-official-r
 - `robot.joint_velocity` / `joint_limits_rad` / `tcp_position_m` / `tcp_quaternion_wxyz`
 - `control_steps`、`sim_time_s` —— 本次 episode 已推进的控制步与仿真时间
 - `task_inputs` —— 任务指令（`text_instruction` 等）
-- `images.first_frame` —— 相机帧（PNG，base64 + sha256）；`images.camera_status`
-  是**运行事实**（拍到没拍到），不是目标答案
+- `images.camera` —— **当前帧**（PNG，base64 + sha256）。它在**每个控制步都更新**，
+  不是只给一次；判「这一帧是不是新的」用 `sha256` 自比。
+  `images.camera_status` 是**运行事实**（拍到没拍到），不是目标答案；
+  拍失败时 `camera` **不会**给上一帧（避免你把过期画面当新的）。
 
 **夹爪开度**从关节位置推：`gripper_opening_m = joint_position[6] - joint_position[7]`。
 

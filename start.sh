@@ -134,7 +134,6 @@ print(f"[track2-runtime] player  = {manifest.root}")
 print(f"[track2-runtime]           skill={manifest.skill_name} "
       f"version={manifest.version} entrypoint={manifest.relative_entrypoint}")
 print(f"[track2-runtime]           tools={','.join(manifest.tool_profile)} "
-      f"gpu={'yes' if manifest.requires_gpu else 'no'} "
       f"code={extracted.code_bytes}B model={extracted.model_bytes}B")
 PY
     # ⚠️ 不要依赖 `set -e` 让这里提前中止 —— 这个函数是在

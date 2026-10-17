@@ -28,15 +28,18 @@ gateway**（实测：`work/scripts/check_sandbox_official.py`）。走既有的 
   → 官方 gateway → dora 通道 → runtime 节点 → ManiSkill
 ```
 
-## 两个沙箱档（Q18）
+## 一档沙箱（2026-10-17 起）
 
-| `requires_gpu` | 档 | 内容 |
-|---|---|---|
-| `false`（默认） | stdlib | 只有标准库、无 GPU —— 与第 4 步之前**逐字一致** |
-| `true` | official | 官方 ML runtime（torch + CUDA），只给 GPU 0 |
+**所有选手包都在同一档里跑**：官方 ML runtime（Python 3.12.14 + torch/CUDA +
+官方预装依赖）+ 一张 GPU。旧契约里的 `requires_gpu` 字段**已删除**
+（`player_manifest.py` 会拒掉它，不静默忽略）。
 
-**这是「允许」不是「要求」**：不带模型的选手走 stdlib 档，一样完整评测。
-声明 `requires_gpu=true` 而官方 runtime 不可用时**明确失败**，不静默降级。
+隔离强度没有退化 —— 独立 mount/pid/user namespace、seccomp、只读挂载、
+看不到宿主与裁判目录、网络仍隔离（工具调用走 JSON-lines 桥）。取消的只是
+「不带模型的选手享受更弱权限」这条区分。
+
+官方 runtime 起不来时**明确失败**，不静默降级 —— 带着一个残缺环境跑完
+20 个回合，比直接失败糟得多。
 
 ## 节点什么时候结束
 
@@ -159,34 +162,34 @@ class PlayerNode:
             return
         print(f"[track2-player] 选手包 OK skill={self.manifest.skill_name} "
               f"entrypoint={self.manifest.relative_entrypoint} "
-              f"tools={','.join(self.manifest.tool_profile)} "
-              f"gpu={'yes' if self.manifest.requires_gpu else 'no'}",
+              f"tools={','.join(self.manifest.tool_profile)}",
               file=sys.stderr, flush=True)
 
-    # ── 沙箱档
+    # ── 沙箱
 
     def _sandbox_spec(self, manifest: PlayerManifest):
+        """唯一一档：官方 runtime（Python 3.12.14 + 预装依赖 + 一张 GPU）。
+
+        旧的 `stdlib` 档已取消（2026-10-17）。它存在的前提是「不带模型的选手
+        不该拿到 torch」—— 但两档的**隔离机制本来就是同一套**，差的只是
+        Python 版本、有没有第三方包、`/dev/shm`、`/proc` 与 CPU 配额。
+        留着它反而制造了一个真实的坑：**选手在 3.12 上写、到 3.10 档炸**。
+
+        起不来就**明确失败** —— 带着残缺环境跑完 20 个回合比直接失败糟得多。
+        """
         from track2_judge.sandbox.official_runtime import (
             RuntimeSpecError, check_official_runtime, official_spec,
         )
-
-        if not manifest.requires_gpu:
-            # 严格档 —— 与第 4 步之前逐字一致（21 项回归跑的就是它）
-            from track2_judge.sandbox.runtime import prepare_runtime
-            from track2_judge.sandbox.official_runtime import stdlib_spec
-            return stdlib_spec(prepare_runtime()), "stdlib"
 
         try:
             spec = official_spec(gateway_port=self.config.gateway_port)
         except RuntimeSpecError as exc:
             raise PlayerConfigError(
-                "contestant package declares requires_gpu=true but the official "
-                f"runtime is unavailable: {exc}") from exc
+                f"official runtime is unavailable: {exc}") from exc
         problems = check_official_runtime(spec)
         if problems:
             raise PlayerConfigError(
-                "contestant package declares requires_gpu=true but the GPU sandbox "
-                "cannot be provided: " + "; ".join(problems))
+                "the sandbox cannot be provided: " + "; ".join(problems))
         return spec, "official"
 
     # ── 等 gateway 就绪
@@ -259,10 +262,9 @@ class PlayerNode:
                 "mode": self.config.mode,
                 "environment": self.config.profile,
                 "tool_call_budget": self.config.tool_call_budget,
-                # 沙箱档是**运行事实**，选手需要知道自己的模型能不能上 GPU。
+                # 沙箱档是**运行事实**，选手需要知道 GPU 能不能用。
                 # 它不含任何裁判私有信息。
-                "sandbox": {"profile": sandbox_profile,
-                            "gpu": bool(manifest.requires_gpu)},
+                "sandbox": {"profile": sandbox_profile, "gpu": True},
             })
             try:
                 skill_result = executor.run(
