@@ -229,6 +229,29 @@ class PlayerNode:
 
     # ── 跑一个 episode
 
+    def _initial_observation(self, client: ToolClient,
+                             bridge: "ProfileGatedBridge") -> dict[str, Any]:
+        """进 `run()` 之前的**第一帧观测**（A2）。
+
+        走的是**选手的那条路**（`bridge` → `ToolClient` → HTTP → gateway →
+        runtime），不另开捷径 —— 所以这个观测与选手随后自己调
+        `tools.observe()` 拿到的**完全同形**（同一个 ToolSpec 收窄、
+        同样的 `images.camera`）。
+
+        用 `bridge` 而不是 `client`：那一层是「选手声明过哪些 Tool」的门禁
+        （`tool_profile` 子集）。选手没声明 `track2.env.observe` 时
+        **这里就该失败** —— 否则等于评测器替他调了一个他没声明的 Tool。
+
+        采不到时**明确失败**，不退回空 dict —— 空 dict 正是这条改动要消灭的
+        东西：选手会在 `observation["robot"]` 上莫名其妙地 `KeyError`。
+        """
+        try:
+            return bridge("observe", {})
+        except Exception as exc:                                # noqa: BLE001
+            raise PlayerConfigError(
+                f"initial observation failed ({type(exc).__name__}: "
+                f"{str(exc)[:200]})") from exc
+
     def run_episode(self, observation: dict | None = None) -> dict[str, Any]:
         assert self.manifest is not None
         manifest = self.manifest
@@ -267,8 +290,28 @@ class PlayerNode:
                 "sandbox": {"profile": sandbox_profile, "gpu": True},
             })
             try:
+                # ⚠️ **初始观测必须真的传进去**（A2 / 2026-10-17）。
+                #
+                #    以前这里是 `observation or {}`，而调用点是
+                #    `self.run_episode()`（无实参）—— 于是选手的
+                #    `run(observation, tools)` 收到的**永远是空 dict**。
+                #    官方示例写的 `observation["robot"]["joint_position"]`
+                #    会直接 `KeyError`；而裁判侧直跑那条路传的是**完整观测** ——
+                #    同一份 skill 在两条路上拿到的东西不一样。
+                #
+                #    现在统一成「先采一次再进去」，与裁判侧同形：
+                #    `run()` 的第一个参数 = `tools.observe()` 的返回（经 ToolSpec 收窄）。
+                #
+                #    ⚠️ 位置：**在 `executor.initialize()` 之后** —— 选手的
+                #    `initialize(context)` 可能要先做自己的准备；采观测不依赖选手，
+                #    但顺序上放在 initialize 之后更贴近「选手先就绪，再拿第一帧」。
+                #
+                #    ⚠️ 这一次 observe 也**会推一帧**（`_publish_frame` 挂在 observe 上），
+                #    与「`observe` 是唯一采样点」的语义一致，不是多余的。
+                if observation is None:
+                    observation = self._initial_observation(client, bridge)
                 skill_result = executor.run(
-                    observation or {}, bridge,
+                    observation, bridge,
                     timeout_s=self.config.timeout_s,
                     max_requests=self.config.tool_call_budget)
             except SkillTimeout:
