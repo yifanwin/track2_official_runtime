@@ -18,6 +18,9 @@ nodes:
       tick: dora/timer/millis/500
       env_in: runtime/env_to_gw
       robot_in: runtime/robot_to_gw
+      # 第 5 步：runtime 每帧喂到这里。名字必须与 gateway.yaml 的
+      # `image_input_ids` 一致，否则 gateway 不认（`dora_adapter.py:213`）。
+      image_from_runtime: runtime/image_to_gw
     outputs:
       - tool_response
       - env_out
@@ -41,6 +44,9 @@ nodes:
     outputs:
       - env_to_gw
       - robot_to_gw
+      # 每控制步推帧（第 5 步）。gateway 收到后编码、盖 seq，经 /ws/images 推给
+      # PAOS 侧的 ForgeObservationCollector。
+      - image_to_gw
 
   # 选手侧：把注入的选手包跑起来，它的 Tool 调用经本节点打官方 gateway。
   #

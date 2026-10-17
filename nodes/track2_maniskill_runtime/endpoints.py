@@ -108,9 +108,14 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
     所以一个类实例可以同时扮演 `observe` / `joint_control` / `gripper_control` 三个操作。
     """
 
-    def __init__(self, adapter_factory, config):
+    def __init__(self, adapter_factory, config, frame_sink=None):
         self._config = config
         self._adapter_factory = adapter_factory
+        # 每帧推给谁（第 5 步）。`sink(camera_payload|None, control_steps)` ——
+        # 由节点接到 dora 的 image 通道上（→ 官方 gateway → `/ws/images`）。
+        # `None` 表示相机这一拍失败；**不推陈旧帧**。
+        self._frame_sink = frame_sink
+        self._frame_count = 0
         self._adapter = None                    # 只在 executor 线程里初始化
         self._executions: dict[str, _Execution] = {}
         self._execution_lock = threading.Lock()
@@ -201,7 +206,31 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
     def _observe_blocking(self, arguments: dict) -> dict:
         adapter = self._require_adapter()
         raw = adapter.observe()
-        return _shape_observation(raw, include_rgb=arguments.get("include_rgb", True))
+        payload = _shape_observation(raw, include_rgb=arguments.get("include_rgb", True))
+        self._publish_frame(payload)
+        return payload
+
+    def _publish_frame(self, payload: dict) -> None:
+        """把刚采的这一帧推给 gateway（经 dora）。
+
+        为什么挂在 `observe` 上而不是挂在 Action 上：`adapter.observe()` 是
+        **唯一的**采样点 —— 选手的 `track2.env.observe` 与 gateway 的
+        `/ws/images` 都从它取，所以两边看到的帧**一定一致**，
+        不会出现「Query 说第 3 步、图上还是第 2 步」。
+
+        ⚠️ 选手不调 `observe` 就不会有新帧 —— 这是**对的**：画面只在被观察时
+        才需要产生，而 `joint_control` 的返回本来就不含图像。
+        """
+        if self._frame_sink is None:
+            return
+        camera = (payload.get("images") or {}).get("camera")
+        try:
+            self._frame_sink(camera, int(payload.get("control_steps", 0)))
+            if camera is not None:
+                self._frame_count += 1
+        except Exception:                                      # noqa: BLE001
+            # 推帧失败**不能**影响物理或 Query —— 选手的观测照常返回
+            pass
 
     # ────────────────────────────────────────────── Action: joint_control / gripper_control
 
@@ -438,8 +467,10 @@ def _shape_observation(raw: dict, *, include_rgb: bool) -> dict:
         out["task_inputs"] = raw["task_inputs"]
     if include_rgb:
         images = {}
+        # 内部原始观测键是 `first_frame`（provider 的缓存名），
+        # 对选手暴露的 ToolSpec 键是 `camera`（每控制步更新）。
         if raw.get("first_frame") is not None:
-            images["first_frame"] = raw["first_frame"]
+            images["camera"] = raw["first_frame"]
         if raw.get("camera_status") is not None:
             images["camera_status"] = str(raw["camera_status"])
         if images:

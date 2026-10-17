@@ -25,8 +25,13 @@ max_concurrency: 1              # Q9：关节控制天然串行
 action_timeout_s: 30.0          # Q14 待 73 case 实测，当前是保守占位值
 stop_confirm_timeout_s: 5.0     # Q13：「等 backend 确认真实停止」的上限
 
-# 观测：第 5 步启用正式相机前，模式 B 的参考图还拿不到（当前 camera_status=NOT CONFIGURED）
-camera_required: false
+# 观测（第 5 步 / 模式 B）
+# 相机默认**必需**：原始图文是选手唯一的感知来源，没相机这条链路不成立。
+# 诊断场景（只想量物理）可以设 false —— 那时不建相机、跑得更快。
+camera_required: true
+
+# 给选手的自然语言指令（公开输入之一，不含任何答案）
+text_instruction: "Move the target object to the position shown in the reference image."
 
 # provider 注册续租间隔（必须小于 gateway.yaml 的 lease_ttl_ms=15000）
 lease_renew_interval_s: 5.0

@@ -45,10 +45,14 @@ class RuntimeConfig:
     stop_confirm_timeout_s: float = 5.0
 
     # ── 观测
-    # 相机是否必需。模式 B（Q4）下目标是原始图文，但当前案例的正式入口
-    # `camera_status` 仍是 `NOT CONFIGURED`（见 §5.3 的改动清单），
-    # 所以这里默认 False —— 第 5 步启用相机后改 true。
-    camera_required: bool = False
+    # 给选手的自然语言指令（模式 B 的公开输入之一）。
+    # 它不含任何答案 —— 「移动哪个物体」本来就在题面里。
+    text_instruction: str = "Move the target object to the position shown in the reference image."
+
+    # 相机是否必需。**第 5 步起默认 True** —— 模式 B（Q4）下原始图文是
+    # 选手唯一的感知来源，没有相机这条链路就不成立。
+    # 保留开关是为了诊断场景（`camera_required=false` 时不建相机，跑得更快）。
+    camera_required: bool = True
 
     # ── provider 注册
     endpoint_instance_id: str = ""
@@ -74,7 +78,8 @@ class RuntimeConfig:
 _KEYS = {
     "case_id", "seed", "casebank", "max_steps", "max_sim_time_s",
     "max_concurrency", "action_timeout_s", "stop_confirm_timeout_s",
-    "camera_required", "endpoint_instance_id", "lease_renew_interval_s",
+    "camera_required", "text_instruction", "endpoint_instance_id",
+    "lease_renew_interval_s",
 }
 
 
