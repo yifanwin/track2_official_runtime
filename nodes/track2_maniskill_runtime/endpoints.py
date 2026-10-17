@@ -117,6 +117,22 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         self._frame_sink = frame_sink
         self._frame_count = 0
         self._adapter = None                    # 只在 executor 线程里初始化
+        # B1/B2：常驻 session 与当前 episode 的记账（**Judge-only**）
+        self._session = None
+        self._session_case: str | None = None
+        #: 建 session 时用的参数签名。换 case / 换 mode / 换相机都对应**不同**
+        #: 的 event policy 与白名单，必须重建 —— 只比 `case_id` 会串味。
+        self._session_signature: tuple | None = None
+        self._episode: dict = {}
+        self._episode_seq: int = 0
+        #: 同一 episode 内的第几次 Skill 执行（`final` 最多 3）。`next_attempt()` 推它。
+        self._attempt_seq: int = 0
+        #: `reset` 之后**立刻**采的初态（judge-only，B2'）。
+        #: 判分要「选手动手之前」的布局，末态替代不了 —— 详见 `_reset_blocking`。
+        self._initial_physical: dict | None = None
+        self._initial_layout: dict | None = None
+        #: 当前 case 的 bundle（`_constraints()` 要用它挑事件约束）
+        self._bundle_cache: dict | None = None
         self._executions: dict[str, _Execution] = {}
         self._execution_lock = threading.Lock()
         # Q9：物理串行化。max_workers=1 保证任何时候只有一个东西在碰 env。
@@ -131,6 +147,225 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
 
     def _open_blocking(self) -> None:
         self._adapter = self._adapter_factory()
+
+    def reset_episode(self, case_id: str, seed: int, mode: str = "final") -> dict:
+        """**Judge-only**：在一个**常驻 flow** 里换 episode（B1）。
+
+        这是「循环归 Judge，flow 常驻」那条边界的落地 —— Judge 通过
+        **私有控制通道**调它，不是 Tool、不注册 ToolSpec、不进 gateway。
+
+        语义（与 `requirement/Track2_边界决策.md` 一致）：
+
+        * 每次调用**重建场景**（`adapter.reset` 内部是 close + factory；
+          建场景实测 2.7 s，相对于 211 s 的 episode 可忽略）—— 见 C3
+        * 重建后**重新装载公开输入**（新布局的参考图不变，标定不变，
+          但 `initial_layout` 变了 —— 所以选手的第一帧必须是新的）
+        * **不 reset 物理状态以外的东西**：选手进程由 player 节点负责（B3/B4）
+
+        ⚠️ `first` / `final` **不是**选手可见语义；它只改**Judge 侧的**证据收集
+        深度（`final` 开 recovery + P5 checkpoints，与 `candidate_runner` 一致），
+        **不改选手那一轮 run() 里能做什么**。
+        """
+        if self._closed:
+            raise ToolError(code="TRACK2_RUNTIME_CLOSED",
+                            message="runtime is closed", retryable=False)
+        if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+            raise ToolError(code="TRACK2_BAD_SEED",
+                            message="seed must be a non-negative integer",
+                            retryable=False)
+        if not isinstance(case_id, str) or not case_id:
+            raise ToolError(code="TRACK2_BAD_CASE",
+                            message="case_id must be a non-empty string",
+                            retryable=False)
+        return self._run_blocking(self._reset_blocking, case_id, seed, mode)
+
+    def next_attempt(self) -> dict:
+        """**Judge-only**：在同一物理状态上追加一次 Skill 执行（B1'）。
+
+        边界决策 §1.2：
+
+        ```text
+        final:
+            从同一个 S0 reset
+            调 run() 最多 3 次
+              第 1 次失败：**不 reset**，再调 run()
+              第 2 次失败：**不 reset**，再调 run()
+        ```
+
+        「不 reset」是关键 —— 第二、三次 `run()` 必须看到**前一次留下的真实终态**
+        （物体被挪过 / 抓过 / 掉过）。所以这里**只**推进 attempt 计数、
+        **不碰场景**。`seq` 也不动：`seq` 表示「新 episode」，attempt 表示
+        「同一 episode 里的第几次执行」。
+
+        ⚠️ 为什么不让 player 自己在 `run()` 里循环：`final` 的语义是「**裁判**
+        看到失败之后**决定**再给一次机会」——中间那次 verify 在裁判侧。
+        让 player 自己循环就等于把判定塞进了选手进程。
+        """
+        if self._closed:
+            raise ToolError(code="TRACK2_RUNTIME_CLOSED",
+                            message="runtime is closed", retryable=False)
+        if not self._episode:
+            raise ToolError(code="TRACK2_NO_EPISODE",
+                            message="no episode has been reset yet",
+                            retryable=False)
+        self._attempt_seq = int(getattr(self, "_attempt_seq", 0)) + 1
+        self._episode = {**self._episode, "attempt": self._attempt_seq}
+        return {"ok": True, **self._episode}
+
+    def _reset_blocking(self, case_id: str, seed: int, mode: str) -> dict:
+        from track2_judge.observation.public_task_view import public_task_inputs
+        from track2_judge.scenario.session import build_case_session
+
+        adapter = self._require_adapter()
+        previous = getattr(self, "_session_case", None)
+        bundle = self._load_bundle(case_id)
+        self._bundle_cache = bundle          # `_constraints()` 从这里取事件约束
+        # ⚠️ **顺序要紧**：公开输入必须在建 session **之前**算出来。
+        #
+        #    第一版把 `public_fields=()` 传给了 `build_case_session()`，然后才在
+        #    下面算 `public` —— 于是 `adapter.reset()` 里那句
+        #    `if set(inputs) - self.__public_fields: raise ValueError('unapproved
+        #    public input')` 直接抛错，整条私有通道**第一个 reset 就废**。
+        #    白名单就是 `public_fields`，它必须与真正传进去的 dict 是同一套键。
+        public = public_task_inputs(bundle, reference_root=self._reference_root(),
+                                    case_id=case_id,
+                                    camera=self._config.camera_required)
+
+        # `final` 要给 P5 事件证据（`candidate_runner` 里 recovery 与 checkpoints
+        # 就是这么来的）—— 没有它 judge_snapshot 的 `physics_health` / P5 是
+        # 「NOT CONFIGURED」，评分侧会缺证据。
+        checkpoints = next(
+            (p["checkpoints"] for p in bundle["contract"].get("predicates", [])
+             if p["type"] == "P5"), [])
+        recovery = mode == "final"
+        # ★ **seed 必须在签名里** —— 否则换 seed 会静默地无效。
+        #
+        #   `build_case_session()` 建的 adapter，其 backend factory 是
+        #   `lambda: create_case_env(bundle, casebank, seed, ...)` —— 那个 `seed`
+        #   是**建 session 时**捕获的。而 `adapter.reset(seed=...)` 只是
+        #   `close(); env = factory(); env.reset(seed=seed)`：**重新建场景用的是
+        #   闭包里的旧 seed**，`env.reset(seed=...)` 本身不做布局随机化
+        #   （布局来自 `initial_layouts[seed]`，在 factory 里选）。
+        #
+        #   实测症状：连着下发 seed=0、seed=3 两个 episode，布局与 RGB 帧的
+        #   sha256 **逐位相同** —— 看起来像「选手看到的是旧题」，而日志里
+        #   一个错都没有。这正是「两条路径各写一遍构造」这类漂移的典型形态。
+        signature = (case_id, int(seed), bool(self._config.camera_required),
+                     recovery, tuple(map(repr, checkpoints)))
+        # 换 case / 换 seed / 换 mode 都必须重建（bundle、布局与事件策略都不同）。
+        if previous != case_id or self._session is None \
+                or self._session_signature != signature:
+            self._session = build_case_session(
+                bundle, self._bank(), seed,
+                camera=self._config.camera_required,
+                public_fields=tuple(public),
+                live=True,
+                checkpoints=checkpoints,
+                recovery=recovery,
+                max_steps=self._config.max_steps,
+                max_sim_time_s=self._config.max_sim_time_s,
+                case_id=case_id)
+            self._session_case = case_id
+            self._session_signature = signature
+            self._adapter = self._session.adapter
+
+        self._session.reset(seed, public_task_inputs=public)
+        # ★ **reset 之后立刻**采一份物理真值（B2'）。
+        #
+        #   为什么必须在这里采：判分要 `initial_layout` —— 那是「选手动手**之前**
+        #   物体在哪」。原来它由裁判侧 `candidate_runner.py:60` 在 `reset()`
+        #   之后立刻读。常驻结构下裁判没有 env，只能从这里拿。
+        #   只在快照里给**末态**是不够的：`mesa_eval` 会拿 initial 做配对校验
+        #   （`first`/`final` 同 seed 的 initial 必须逐位相等），
+        #   `ResultGate` 也会重算 canonical 哈希比一次（`PAIRED_STATE_INVALID`）。
+        #   而「末态」用不了 —— 那正是选手操作过的结果。
+        self._initial_physical = self._session.adapter.get_final_state()
+        self._initial_layout = self._session.adapter.get_layout()
+        # `seq` 单调递增 —— **player 节点靠它判断「有新 episode 了」**（B4）。
+        # 不用 `(case_id, seed)` 比对：同一个 seed 重跑是合法操作。
+        #
+        # 顺带把 attempt 归零：attempt 只在**同一个 episode 内**有意义
+        # （`final` 最多 3 次 run）。`next_attempt()` 只推它，不推 `seq`。
+        self._episode_seq = int(getattr(self, "_episode_seq", 0)) + 1
+        self._attempt_seq = 1
+        self._episode = {"case_id": case_id, "seed": seed, "mode": mode,
+                         "seq": self._episode_seq, "attempt": self._attempt_seq}
+        # ★ **初态要在这里采**（见上）—— 但 `final` 的第 2/3 次 attempt
+        #   用的是**同一份初态**（不 reset），所以 `_initial_*` 不再更新。
+        return {"ok": True, **self._episode}
+
+    # ── 私有控制通道需要的三个取数（都不进 Tool 面）
+
+    def _bank(self):
+        from pathlib import Path
+        from track2_judge.cli.select_case import CASEBANK
+        return Path(self._config.casebank) if getattr(self._config, "casebank", None) else CASEBANK
+
+    def _reference_root(self):
+        from track2_judge.cli.select_case import REFERENCE_ROOT
+        return REFERENCE_ROOT
+
+    def _load_bundle(self, case_id: str) -> dict:
+        import json
+        path = self._bank() / "cases" / case_id / "case.json"
+        if not path.is_file():
+            raise ToolError(code="TRACK2_BAD_CASE",
+                            message=f"case not found: {case_id}", retryable=False)
+        return json.loads(path.read_text(encoding="utf8"))
+
+    def judge_snapshot(self) -> dict:
+        """**Judge-only**：当前**实际跑过的那个 env** 的物理快照（B2）。
+
+        ⚠️ 绝对不许另建同 seed 场景再读 —— `same seed` 恢复不了选手执行产生的
+        物体终态 / 碰撞 / 滑落 / 接触 / 动态误差。见边界决策 §3。
+        """
+        adapter = self._require_adapter()
+        return self._run_blocking(self._judge_snapshot_blocking)
+
+    def _judge_snapshot_blocking(self) -> dict:
+        adapter = self._require_adapter()
+        return {
+            "episode": dict(getattr(self, "_episode", {}) or {}),
+            # ── 末态（选手操作之后）
+            "layout": adapter.get_layout(),
+            "physical": adapter.get_final_state(),
+            # ── 初态（`reset` 之后立刻采的那一份，B2'）
+            #
+            # 判分要「选手动手**之前**物体在哪」：`mesa_eval` 用它做配对校验，
+            # `ResultGate` 用它比 canonical 哈希。**末态替代不了它**。
+            # 见 `_reset_blocking` 里那次采样的注释。
+            "initial_physical": self._initial_physical,
+            "initial_layout": self._initial_layout,
+            "physics_health": adapter.get_physics_health(),
+            # ── 事件证据（P5 / 事件约束）
+            #
+            # 73 例 profile 下它是 `{'event_counts': {}, 'coverage': 'NOT CONFIGURED',
+            # 'P5': {'status': 'NOT CONFIGURED'}}` —— 够用（那批题的
+            # `event_constraints` 是空的）。但**必须随快照给出**，而不是让裁判
+            # 自己编一个：一旦将来有题真的启用了事件约束，裁判编的那个会
+            # 悄悄变成「证据缺失却通过」。
+            "event_evidence": self._event_evidence(),
+        }
+
+    def _event_evidence(self) -> dict:
+        """按本 case 真正启用的约束集采事件证据。
+
+        `enabled` 的取法与 `candidate_runner.py:52` 一致：从
+        `contract.constraints` 里挑出属于事件类（`EVENTS`）的那些。
+        """
+        try:
+            from track2_judge.scoring.frozen_scorer import mesa_eval
+            events = set(getattr(mesa_eval, "EVENTS", ()))
+            enabled = [c for c in self._constraints()
+                       if (c.get("type") if isinstance(c, dict) else None) in events]
+            return self._require_adapter().get_event_evidence(bool(enabled))
+        except Exception as exc:                                # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "coverage": "UNAVAILABLE"}
+
+    def _constraints(self) -> list:
+        contract = (self._bundle_cache or {}).get("contract") or {}
+        return list(contract.get("constraints") or [])
 
     def close(self) -> None:
         self._closed = True

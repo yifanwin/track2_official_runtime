@@ -32,6 +32,17 @@ __pycache__/
 # 它们会被打包脚本扫进去，必须在打包前清掉
 /profiles/*/.*.yaml
 
+# ── 常驻链路的运行时文件（B1/B4 / C2）
+#
+# 三样都是**每轮评测现写**的，不该跟着 Bundle 走：
+#   .judge_control.json    Judge 私有控制口的端口（后端由 runtime 节点开）
+#   .episode_results.jsonl player 每跑完一轮写的握手行
+#   out/                   dora daemon 的节点日志（`dora start --detach` 下
+#                          stdout 住在这里，要 `dora logs` 才取得到）
+/profiles/*/.judge_control.json
+/profiles/*/.episode_results.jsonl
+/profiles/*/out/
+
 # 节点日志
 /logs/
 *.log

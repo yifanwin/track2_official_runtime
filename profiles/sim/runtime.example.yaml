@@ -35,3 +35,14 @@ text_instruction: "Move the target object to the position shown in the reference
 
 # provider 注册续租间隔（必须小于 gateway.yaml 的 lease_ttl_ms=15000）
 lease_renew_interval_s: 5.0
+
+# Judge-only 私有控制口（B1）。**0 = 关闭**（CPU 回归不开监听）。
+#
+# >0 时 runtime 节点在 loopback 上开一个只给裁判用的 HTTP 口：
+#   POST /episode/reset     换 episode（case/seed/mode）
+#   GET  /episode/snapshot  judge-only 真值（选手够不到 —— 沙箱无网络）
+#
+# ⚠️ 走**配置**而不是环境变量：`dora start --detach` 下节点由长命的
+#    dora daemon spawn，daemon 环境里没有评测时设的变量 —— 用环境变量
+#    会静默地不开控制口。裁判侧逐次渲染本文件，端口一定到得了。
+judge_control_port: 0

@@ -106,6 +106,72 @@ class PlayerConfig:
         self.mode = (env.get("TRACK2_MODE") or "final").strip() or "final"
         # 等 gateway + provider 注册就绪的上限（建场景要几十秒）
         self.ready_timeout_s = float(env.get("TRACK2_PLAYER_READY_TIMEOUT_S") or 300)
+        # Judge 私有控制口的地址（B1/B4）。**不给 = 空串 = 关闭常驻**，
+        # 此时跑完一次 `run_episode()` 就空转 —— 回归/单例评测依赖这个行为。
+        self.control_url = self._control_url(env)
+
+    def _control_url(self, env: dict[str, str]) -> str:
+        """从环境变量**或** Bundle 里的控制口文件取端口。
+
+        ⚠️ **两个来源，缺一不可**：
+
+        | 场景 | 谁 spawn 本节点 | 环境变量在不在 |
+        |---|---|---|
+        | `dora run`（前台，测/调试） | 本地 CLI | ✅ 在 |
+        | `dora start --detach`（正式） | **长命的 dora daemon** | ❌ **不在** |
+
+        daemon 是常驻进程，它的环境里没有评测时设的变量（实测
+        `/proc/<daemon>/environ` 里 0 个 `TRACK2*`）。只读环境变量的话，
+        正式形态下本节点会**静默地**不常驻 —— 表现是「judge 下发 episode
+        之后一直等不到结果」，而日志里一个错都没有。
+
+        所以正式形态走**文件**：裁判在起 flow 之前把端口写到
+        `profiles/<profile>/.judge_control.json`，收工后删掉。
+        那个路径在 Bundle 里，而选手沙箱只挂 `player/` 一个目录 —— 选手看不到。
+        """
+        port = (env.get("TRACK2_JUDGE_CONTROL_PORT") or "").strip()
+        if not port:
+            # ⚠️ **不要用 `self.bundle_root` 拼这个路径**。`bundle_root` 来自
+            #    `PAOS_SKILL_ROOT`，而这个变量在 `--detach` 形态下不可靠
+            #    （实测节点拿到的是**别的** Bundle 的值）。包装脚本
+            #    `run_player.sh` 已经用 `$(pwd)`（= dora 设的 `profiles/<p>/`）
+            #    算好了绝对路径，直接用。
+            marker = Path(env.get("TRACK2_CONTROL_MARKER")
+                          or (self.bundle_root / "profiles" / self.profile
+                              / ".judge_control.json"))
+            try:
+                port = str(json.loads(marker.read_text(encoding="utf8"))
+                           .get("port") or "").strip()
+            except (OSError, ValueError, AttributeError):
+                port = ""
+        if not port:
+            return ""
+        host = (env.get("TRACK2_JUDGE_CONTROL_HOST") or "127.0.0.1").strip()
+        return f"http://{host}:{int(port)}"
+
+    @property
+    def results_path(self) -> Path | None:
+        """常驻模式下把每个 episode 的结果**追加**到这里（JSON Lines）。
+
+        ⚠️ 为什么落到文件而不是只发 dora 输出通道：正式形态是
+        `dora start --detach`，那种形态下节点 stdout **不回流**到 Judge 的
+        日志文件（日志住在 daemon 里，只能 `dora logs` 取）。而 Judge 要
+        「下发 episode → 等这一轮真的跑完」。文件是最直接的握手：
+        Judge 起 flow 前清空、每轮读新增行。
+
+        不常驻（`control_url` 为空）时**不写** —— 回归/单例评测不受影响。
+        ⚠️ 这个方法挂在 **`PlayerConfig`** 上 —— 里面是 `self.control_url`，
+        不是 `self.config.control_url`（第一版写错了，异常被 `_emit` 的兜底
+        `except` 吃掉，表现成「文件一直不出现」而**没有任何报错**）。
+        """
+        if not self.control_url:
+            return None
+        # 与 `_control_url` 同一个理由：用包装脚本算好的 cwd，不用 `bundle_root`。
+        base = os.environ.get("TRACK2_PROFILE_DIR")
+        if base:
+            return Path(base) / ".episode_results.jsonl"
+        return (self.config.bundle_root / "profiles" / self.config.profile
+                / ".episode_results.jsonl")
 
     @property
     def gateway_port(self) -> int:
@@ -279,6 +345,10 @@ class PlayerNode:
         lifecycle: list[str] = []
         executor = PackageExecutor(package, work, isolated=True, trusted=False,
                                    timeout_s=self.config.timeout_s, spec=spec)
+        # 沙箱进程的**宿主侧 pid**。进 summary 是给裁判核 B4 用的：
+        # 「第 2 个 episode 的选手进程是不是新的」。沙箱内部 `os.getpid()` 永远
+        # 是 1（自己的 PID 命名空间），**选手自己报不出来这件事**。
+        sandbox_pid = executor.process.p.pid
         try:
             executor.initialize({
                 "skill_api_version": manifest.api_version,
@@ -327,6 +397,7 @@ class PlayerNode:
             "status": status,
             "skill": manifest.skill_name,
             "sandbox_profile": sandbox_profile,
+            "sandbox_pid": sandbox_pid,
             "tool_calls": len(bridge.calls),
             "lifecycle": lifecycle,
             "result": skill_result,
@@ -336,49 +407,195 @@ class PlayerNode:
 
     def run(self) -> int:
         self.prepare()
-        if self.manifest is not None:
+        if self.manifest is None:
+            self._idle()
+            return 0
+        try:
+            if not self.wait_ready():
+                raise PlayerConfigError(
+                    f"gateway at {self.config.gateway_url} never became ready")
+        except (PlayerConfigError, OSError, ValueError, RuntimeError) as exc:
+            self._report_error(exc)
+            self._idle()
+            return 0
+
+        # ── B4：Judge 起了控制口 → **常驻**，一个 flow 里连续跑多个 episode
+        #
+        # 以前跑完一次 `run_episode()` 就直接**空转等 STOP**，所以「循环归 Judge，
+        # flow 常驻」那条边界落不了地（Judge 只能靠起停 flow 来换 episode，
+        # 而每次起停要 ~33 s，且 20 个回合 × 73 个 case 完全不可行）。
+        #
+        # 常驻时的形状：
+        #
+        #   Judge ──(私有通道 POST /episode/reset)──▶ runtime 节点（换 case/seed）
+        #     │                                        │
+        #     └──── 轮询 GET /episode/snapshot ◀───────┘
+        #                    ▲
+        #                    │ 本节点（player）看 `seq` 变了就跑一轮 skill
+        #
+        # ⚠️ **不设 `TRACK2_JUDGE_CONTROL_PORT` 时行为完全不变**：跑一次
+        #    `run_episode()` 就进空转 —— 21 项回归与单例评测都依赖它。
+        #    常驻路径下**不预跑** episode：第一个 episode 由 Judge 的第一次
+        #    `reset` 下发（`seq=1`），否则会白跑一轮。
+        if self.config.control_url:
+            self._follow_episodes(self.config.control_url)
+            return 0
+
+        try:
+            self.summary = self.run_episode()
+        except (PlayerConfigError, OSError, ValueError, RuntimeError) as exc:
+            self._report_error(exc)
+        self._report_summary()
+        self._emit(self.summary)
+        self._idle()
+        return 0
+
+    # ── 收尾 / 空转
+
+    def _idle(self) -> None:
+        """dora 节点必须**持续消费输入**，否则上游发消息会阻塞。"""
+        for event in self.node:
+            if event["type"] == "STOP":
+                return
+
+    def _report_error(self, exc: BaseException) -> None:
+        self.summary = {"status": "error",
+                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                        "skill": self.manifest.skill_name if self.manifest else None}
+        # ⚠️ 打印**完整**回溯。只打 `str(exc)` 会得到
+        #    `package execution/protocol rejected` 这种
+        #    来自协议层的笼统消息，真正的根因（HTTP 失败、
+        #    物理拒绝、超时）就丢了 —— 白绕一轮。
+        import traceback
+        print("[track2-player] " + traceback.format_exc(), file=sys.stderr, flush=True)
+        self._report_summary()
+
+    def _report_summary(self) -> None:
+        # 摘要一行（不含 result，避免刷屏）
+        print("[track2-player] 结束：" +
+              json.dumps({k: v for k, v in self.summary.items() if k != "result"},
+                         ensure_ascii=False), file=sys.stderr, flush=True)
+        # 选手返回的东西单独打，**有界**截断 —— 它是选手自己写的，
+        # 可能很大，但正是排查时最需要看的。
+        skill_result = self.summary.get("result")
+        if skill_result:
+            text = json.dumps(skill_result, ensure_ascii=False, default=str)
+            print("[track2-player] 选手返回：" + text[:8000],
+                  file=sys.stderr, flush=True)
+
+    # ── 常驻模式（B4）
+
+    _POLL_S = 0.5
+
+    def _follow_episodes(self, control: str) -> None:
+        """轮询私有控制口的 `seq`，每变一次就跑一个 episode。
+
+        **为什么是轮询而不是推送**：dora 不提供外部 publish（`dora topic` 只有
+        list/echo/hz/info，实测），而选手侧将来要连的 gateway 也不能被这套
+        私有通道污染。`0.5 s` 的轮询相对于 `211 s` 的 episode 完全可忽略。
+
+        **两种等待用同一个超时**（`Node.next(timeout)`）—— 一个循环同时
+        「收 dora 事件」与「看控制口」，不需要另起线程。收到 `STOP` 立即退出。
+        """
+        import json as _json
+        import time
+        import urllib.request
+
+        seen = 0
+        seen_attempt = 0
+        print(f"[track2-player] 常驻模式，控制口 {control}",
+              file=sys.stderr, flush=True)
+        while True:
+            if self._stop_requested():
+                print("[track2-player] 收到 STOP，退出常驻",
+                      file=sys.stderr, flush=True)
+                return
+
             try:
-                if not self.wait_ready():
-                    raise PlayerConfigError(
-                        f"gateway at {self.config.gateway_url} never became ready")
+                with urllib.request.urlopen(
+                        control + "/episode/snapshot", timeout=10) as r:
+                    snapshot = _json.loads(r.read())
+            except Exception as exc:                            # noqa: BLE001
+                print(f"[track2-player] 控制口不可用（{type(exc).__name__}），稍后重试",
+                      file=sys.stderr, flush=True)
+                time.sleep(2.0)
+                continue
+
+            seq = int((snapshot.get("episode") or {}).get("seq") or 0)
+            attempt = int((snapshot.get("episode") or {}).get("attempt") or 1)
+            # `seq == 0` = **还没有任何 episode**（runtime 的计数器从 0 起，
+            # 第一次 `reset` 才变 1）。不排除它的话，节点一起来就会先跑一轮
+            # 「空 episode」—— 而第一轮观测还是未 reset 的场景。
+            if seq <= 0 or (seq == seen and attempt <= seen_attempt):
+                continue
+            fresh = seq > seen                 # 新 episode（要新建沙箱进程）
+            seen, seen_attempt = seq, attempt
+            self._current_seq = seq
+            self._current_attempt = attempt
+            episode = snapshot.get("episode") or {}
+            print(f"[track2-player] 新 episode seq={seq} attempt={attempt} "
+                  f"case={episode.get('case_id')} seed={episode.get('seed')} "
+                  f"mode={episode.get('mode')}"
+                  + ("" if fresh else "（同一 episode 的追加执行，**不 reset**）"),
+                  file=sys.stderr, flush=True)
+            try:
+                # ⚠️ 每一轮都**新建** `PackageExecutor`（B3-a）：选手进程是新的，
+                #    模块级状态不会跨 episode 泄漏 —— 否则第 2 个 episode 会拿到
+                #    上一轮残留的全局变量，而且「同一份 skill 两次结果不一致」
+                #    这种 bug 会被裁判当成随机性。
+                #
+                #    `attempt`（同一 episode 的第 2/3 次）**同样**新建 ——
+                #    `final` 的语义是「**裁判**看到失败后再给一次机会」，
+                #    每次机会都该是干净的一次尝试，而不是接在某个残留的
+                #    进程状态上。
                 self.summary = self.run_episode()
-            except (PlayerConfigError, OSError, ValueError, RuntimeError) as exc:
+                self._report_summary()
+            except Exception as exc:                            # noqa: BLE001
                 self.summary = {"status": "error",
                                 "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                                 "skill": self.manifest.skill_name}
-                # ⚠️ 打印**完整**回溯。只打 `str(exc)` 会得到
-                #    `package execution/protocol rejected` 这种
-                #    来自协议层的笼统消息，真正的根因（HTTP 失败、
-                #    物理拒绝、超时）就丢了 —— 白绕一轮。
-                import traceback
-                print("[track2-player] " + traceback.format_exc(),
-                      file=sys.stderr, flush=True)
-            # 摘要一行（不含 result，避免刷屏）
-            print("[track2-player] 结束：" +
-                  json.dumps({k: v for k, v in self.summary.items() if k != "result"},
-                             ensure_ascii=False), file=sys.stderr, flush=True)
-            # 选手返回的东西单独打，**有界**截断 —— 它是选手自己写的，
-            # 可能很大，但正是排查时最需要看的。
-            skill_result = self.summary.get("result")
-            if skill_result:
-                text = json.dumps(skill_result, ensure_ascii=False, default=str)
-                print("[track2-player] 选手返回：" + text[:8000],
+                print("[track2-player] episode 失败：" + self.summary["error"],
                       file=sys.stderr, flush=True)
             self._emit(self.summary)
 
-        # dora 节点要**持续消费输入**，否则上游发消息会阻塞。
-        for event in self.node:
-            if event["type"] == "STOP":
-                break
-        return 0
+    def _stop_requested(self) -> bool:
+        """带超时地看一眼 dora 输入；`timeout` 到了就返回 False。
+
+        ⚠️ 不能用 `for event in self.node:` —— 那是**阻塞**的，常驻循环会被
+        卡死在这里，HTTP 轮询再也不执行（第一版就是这么写的，等于没常驻）。
+        """
+        try:
+            event = self.node.next(timeout=self._POLL_S)
+        except Exception:                                      # noqa: BLE001
+            return False
+        if not event:
+            return False
+        return event.get("type") == "STOP"
 
     def _emit(self, payload: dict[str, Any]) -> None:
-        """把结果发到 `player_result` 输出通道（没有下游时静默忽略）。"""
+        """把结果发到 `player_result` 输出通道（没有下游时静默忽略），
+        并在常驻模式下**同时落盘**（Judge 靠它握手，见 `results_path`）。"""
+        text = json.dumps(payload, ensure_ascii=False, default=str)
         try:
-            self.node.send_output(
-                "player_result",
-                pa.array([json.dumps(payload, ensure_ascii=False, default=str)]))
+            self.node.send_output("player_result", pa.array([text]))
         except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            path = self.config.results_path
+        except Exception:                                      # noqa: BLE001
+            return
+        if path is None:
+            return
+        try:
+            # `seq` 要跟着走 —— Judge 靠它把「结果」与「哪一轮」对上。
+            record = {"seq": int(getattr(self, "_current_seq", 0) or 0),
+                      "attempt": int(getattr(self, "_current_attempt", 1) or 1),
+                      "result": payload}
+            with path.open("a", encoding="utf8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
             pass
 
 

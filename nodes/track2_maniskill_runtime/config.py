@@ -58,11 +58,29 @@ class RuntimeConfig:
     endpoint_instance_id: str = ""
     lease_renew_interval_s: float = 5.0
 
+    # ── Judge-only 私有控制口（B1）
+    #
+    # **0 = 关闭**（CPU 回归不开监听）。>0 时 runtime 节点在 loopback 上开一个
+    # 只给裁判用的 HTTP 口（换 episode / 取 judge-only 快照）。
+    #
+    # ⚠️ 为什么是**配置项**而不是环境变量：`dora start --detach` 之后节点由
+    #    **长命的 dora daemon** spawn，daemon 的环境里没有评测时设的那些变量
+    #    （实测 `/proc/<daemon>/environ` 里 0 个 `TRACK2*`）——
+    #    走环境变量会**静默地**不开控制口。`runtime.yaml` 由裁判逐次渲染，
+    #    一定到得了节点。
+    #
+    # 它**不是 Tool**：不注册 ToolSpec、不出现在 `GET /tools`、不进选手 context。
+    judge_control_port: int = 0
+
     def __post_init__(self) -> None:
         if not isinstance(self.case_id, str) or not self.case_id.strip():
             raise ConfigError("case_id must be a non-empty string")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
             raise ConfigError("seed must be a non-negative integer")
+        if isinstance(self.judge_control_port, bool) \
+                or not isinstance(self.judge_control_port, int) \
+                or self.judge_control_port < 0:
+            raise ConfigError("judge_control_port must be a non-negative integer")
         for name in ("max_steps", "max_concurrency"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -79,7 +97,7 @@ _KEYS = {
     "case_id", "seed", "casebank", "max_steps", "max_sim_time_s",
     "max_concurrency", "action_timeout_s", "stop_confirm_timeout_s",
     "camera_required", "text_instruction", "endpoint_instance_id",
-    "lease_renew_interval_s",
+    "lease_renew_interval_s", "judge_control_port",
 }
 
 
