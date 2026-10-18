@@ -22,7 +22,7 @@ max_sim_time_s: 120.0
 
 # Action 治理（Q9 / Q12 / Q14）
 max_concurrency: 1              # Q9：关节控制天然串行
-action_timeout_s: 30.0          # Q14 待 73 case 实测，当前是保守占位值
+action_timeout_s: 5.0           # Q14（2026-10-18）：73 例实测 p99 0.675 / max 0.940 s
 stop_confirm_timeout_s: 5.0     # Q13：「等 backend 确认真实停止」的上限
 
 # 观测（第 5 步 / 模式 B）

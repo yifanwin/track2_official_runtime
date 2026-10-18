@@ -384,7 +384,8 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         ## 为什么需要它
 
         `runtime.yaml` 的 `action_timeout_s` 现在是 `30.0`，标着
-        `PROVISIONAL_PENDING_MEASUREMENT`（Q14 要求「用 73 case 实测动作耗时后确定」）。
+        `MEASURED_73_CASES_P99_PLUS_MARGIN`（Q14：73 case 实测 p99 0.675 / max 0.940 s
+        → 取 5.0 s，2026-10-18）。
         **数据其实一直在采**（`_run_action` 里每次都记 `started_at_s` /
         `finished_at_s`），只是没有任何出口 —— 于是「标定 Q14」看起来要专门跑一轮。
 

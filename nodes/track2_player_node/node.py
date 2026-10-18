@@ -66,10 +66,20 @@ from track2_judge.runner.skill_manifest import (         # noqa: E402
     SkillPackage, SkillValidationError,
 )
 from track2_judge.sandbox.package import PackageExecutor  # noqa: E402
-from track2_judge.sandbox.rpc import SecurityNotReady, SkillTimeout  # noqa: E402
-from track2_judge.toolapi.client import (                # noqa: E402
-    HttpTransport, SandboxBridge, ToolCallError, ToolClient,
+from track2_judge.sandbox.rpc import (                    # noqa: E402
+    BudgetTimeout, SecurityNotReady, SkillTimeout,
 )
+from track2_judge.toolapi.client import (                # noqa: E402
+    ActionStoppedUnknown, ActionTimeout, HttpTransport, SandboxBridge,
+    ToolCallError, ToolClient,
+)
+
+#: 选手侧「链路故障」的显式归类（2026-10-18）。
+#
+# 它们是 `ToolCallError` 的子类，**不继承** `BudgetTimeout` —— 归到
+# `infrastructure_timeout`。这样 `ResultGate` 能一眼把「正常预算耗尽」与
+# 「gateway/链路坏了」分开：前者放行（按当前物理状态判分），后者阻断。
+INFRASTRUCTURE_ERRORS = (ActionStoppedUnknown, ActionTimeout, ToolCallError)
 
 __all__ = ["PlayerConfig", "PlayerConfigError", "PlayerNode", "main", "start_player"]
 
@@ -102,7 +112,7 @@ class PlayerConfig:
             env.get("TRACK2_PLAYER_DIR") or default_player).expanduser()
         self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 600)
         self.tool_call_budget = int(env.get("TRACK2_TOOL_CALL_BUDGET") or 2400)
-        self.action_timeout_s = float(env.get("TRACK2_ACTION_TIMEOUT_S") or 30)
+        self.action_timeout_s = float(env.get("TRACK2_ACTION_TIMEOUT_S") or 5)
         self.mode = (env.get("TRACK2_MODE") or "final").strip() or "final"
         # 等 gateway + provider 注册就绪的上限（建场景要几十秒）
         self.ready_timeout_s = float(env.get("TRACK2_PLAYER_READY_TIMEOUT_S") or 300)
@@ -384,8 +394,18 @@ class PlayerNode:
                     observation, bridge,
                     timeout_s=self.config.timeout_s,
                     max_requests=self.config.tool_call_budget)
+            except BudgetTimeout:
+                # ★ 正常预算耗尽（600 s 墙钟 / 控制步预算）—— **不是执行异常**。
+                #   语义：到时间 → 停止执行 → 冻结当前物理状态 → 照常按 P1/P2/C1 判分。
+                #   `ResultGate` 放行这个终态。
+                status = "budget_timeout"
+            except INFRASTRUCTURE_ERRORS:
+                # ★ 链路故障（丢包 / 503 / 动作超时且物理状态不明）——
+                #   **不能伪装成正常超时**，`ResultGate` 要按执行异常阻断。
+                status = "infrastructure_timeout"
             except SkillTimeout:
-                status = "timeout"
+                # 兜底：仍是 `SkillTimeout` 但不属于上面两类（理论上不该出现）。
+                status = "infrastructure_timeout"
         except SecurityNotReady as exc:
             status = "security_not_ready"
             skill_result = {"error": str(exc)}
@@ -551,7 +571,10 @@ class PlayerNode:
                 self.summary = self.run_episode()
                 self._report_summary()
             except Exception as exc:                            # noqa: BLE001
-                self.summary = {"status": "error",
+                # 常驻循环里的兜底 = **链路/编排层故障**（不是选手预算耗尽）。
+                # 归到 `infrastructure_timeout`，让 `ResultGate` 按执行异常阻断 ——
+                # 绝不伪装成正常超时。
+                self.summary = {"status": "infrastructure_timeout",
                                 "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                                 "skill": self.manifest.skill_name}
                 print("[track2-player] episode 失败：" + self.summary["error"],

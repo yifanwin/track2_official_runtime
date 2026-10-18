@@ -39,8 +39,8 @@ class RuntimeConfig:
     max_concurrency: int = 1
     # Q12：每个 Action 必须有执行超时
     # Q14：秒数待 73 case 实测 —— 实测前的保守占位值
-    action_timeout_s: float = 30.0
-    action_timeout_source: str = "PROVISIONAL_PENDING_MEASUREMENT"
+    action_timeout_s: float = 5.0
+    action_timeout_source: str = "MEASURED_73_CASES_P99_PLUS_MARGIN"
     # Q13：cancel 之后最多等这么久「backend 确认真实停止」
     stop_confirm_timeout_s: float = 5.0
 
