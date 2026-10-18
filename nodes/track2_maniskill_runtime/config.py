@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-__all__ = ["RuntimeConfig", "load_config", "ConfigError"]
+__all__ = ["RuntimeConfig", "load_config", "ConfigError", "rotate_instance_id"]
 
 
 class ConfigError(ValueError):
@@ -69,6 +69,25 @@ class RuntimeConfig:
     oracle_planning: bool = False
 
     # ── provider 注册
+    #
+    # ⚠️ **这个值会被轮换（2026-10-18，丢包自锁修复 ②-A1）**。
+    #
+    # 它不再是「一个进程一个值」—— provider 会在**每次 `reset`（换 episode）**
+    # 换一个新的 instance id，并重新 `endpoint.register`。原因：
+    #
+    # gateway 的并发围栏（`occupies_concurrency`）**只有一条释放路径** ——
+    # `mark_instance_ambiguous`，触发条件是「注册的 instance 与 invocation 钉住的
+    # instance 不一致」（`tool_directory.py` 的 `register_with_change`：换 id 会把
+    # 旧的注册放进 `removed`，`_finish_unclaimed_for_removed_locked` 随即调
+    # `mark_instance_ambiguous` 释放围栏）。
+    #
+    # 而一次丢包会让 `max_concurrency = 1` 的槽位**永久占死**（详见
+    # `plan/Track2_丢包自锁修复方案.md`）—— 因为我们的 provider 整轮常驻、
+    # 每 5 s 续租，那个「不一致」永远不成立。换 id 就是让 gateway 眼里的
+    # provider「死一次」，把围栏要回来；物理侧完全连续，场景不重建。
+    #
+    # 实现上**保持 `frozen=True`**：轮换走 `rotate_instance_id()`（`dataclasses.replace`），
+    # 计数器放在 `node.py` 里，不改本类的不可变语义。
     endpoint_instance_id: str = ""
     lease_renew_interval_s: float = 5.0
 
@@ -169,6 +188,51 @@ def load_config(config_path: str | Path | None = None) -> RuntimeConfig:
     kwargs = {k: v for k, v in data.items() if k in _KEYS}
     kwargs["casebank"] = casebank
     if not kwargs.get("endpoint_instance_id"):
-        # 每个进程一个实例 ID —— gateway 靠它做 provider 路由
-        kwargs["endpoint_instance_id"] = f"track2-runtime-{os.getpid()}"
+        # 每个进程一个实例 ID —— gateway 靠它做 provider 路由。
+        # `.0` 是 epoch 后缀，换 episode 时由 `rotate_instance_id()` 递增。
+        kwargs["endpoint_instance_id"] = f"{_INSTANCE_BASE}-{os.getpid()}.0"
     return RuntimeConfig(**kwargs)
+
+
+#: instance id 的基名。轮换时是 `<base>-<pid>.<epoch>`。
+_INSTANCE_BASE = "track2-runtime"
+
+
+def _instance_base(instance_id: str) -> str:
+    """从当前 instance id 里取基名（去掉尾部的 `.<digits>` 后缀）。
+
+    用**正则**而不是 `split('.')` —— 基名里可能合法地含点
+    （id 规则只要求非空字符串，见 `forge_tool/handler.py` 的 `_validate_identifier`）。
+    """
+    import re
+    return re.sub(r"\.\d+$", "", instance_id) or f"{_INSTANCE_BASE}-{os.getpid()}"
+
+
+def rotate_instance_id(config: RuntimeConfig, epoch: int) -> RuntimeConfig:
+    """换一个新的 `endpoint_instance_id`（丢包自锁修复 ②-A1）。
+
+    ## 为什么需要它
+
+    gateway 的并发围栏只有 `mark_instance_ambiguous` 一条释放路径，而它的触发
+    条件是「注册的 instance ≠ invocation 钉住的 instance」。我们整轮常驻并
+    **持续续租**，那个不一致永远不成立 → 一次丢包就把 `max_concurrency = 1`
+    的槽位占到 run 结束（实测：全量 73 例里 17 例受影响）。换 id 是让 gateway
+    眼里的 provider「死一次」。
+
+    ## 为什么保持 `frozen=True`
+
+    `RuntimeConfig` 是不可变的（多处共享同一实例），直接改字段会污染别人。
+    轮换用 `dataclasses.replace` 造**新**实例，`node.py` 持有它并同步给
+    handler 与所有 register 路径。
+
+    ⚠️ 旧 id 的注册会在 gateway 侧进 `removed` → 触发
+    `mark_instance_ambiguous` → **该实例所有未终态 invocation 被标 ambiguous**。
+    这正是我们要的（围栏释放），但要确保轮换发生在**没有在飞的动作**的时刻
+    —— `node.py` 只在 `reset` 时轮换，而 reset 的语义本来就是「上一轮结束、
+    下一轮开始」（边界决策：循环归 Judge，逐 episode 下发）。
+    """
+    import dataclasses
+
+    return dataclasses.replace(
+        config,
+        endpoint_instance_id=f"{_instance_base(config.endpoint_instance_id)}.{int(epoch)}")

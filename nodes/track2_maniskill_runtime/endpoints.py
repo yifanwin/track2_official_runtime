@@ -151,6 +151,13 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         # Q9：物理串行化。max_workers=1 保证任何时候只有一个东西在碰 env。
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="track2-physics")
         self._closed = False
+        # ★ ②-A1（2026-10-18）：换 instance id 的钩子。
+        #
+        #   由 `node.py` 注入 —— 它持有 handler（`endpoint_instance_id` 是只读
+        #   property）与所有 register 路径，能同时把新 id 同步过去。endpoints
+        #   这边只在 `_reset_blocking` 的**最后**触发它，那时本 episode 的
+        #   provider 侧工作已全部结束，没有在飞的动作会被误标 ambiguous。
+        self.on_episode_started = None
 
     # ────────────────────────────────────────────── 生命周期
 
@@ -310,8 +317,34 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         #   （`first`/`final` 同 seed 的 initial 必须逐位相等），
         #   `ResultGate` 也会重算 canonical 哈希比一次（`PAIRED_STATE_INVALID`）。
         #   而「末态」用不了 —— 那正是选手操作过的结果。
+        # ★ ②-A1（2026-10-18）：换 instance id 的钩子 —— **必须在 `seq` 递增
+        #   **之前**调用。
+        #
+        #   顺序理由：player 是靠轮询 `/episode/snapshot` 看到 `seq` 变了才开始
+        #   下一轮 skill 的。若先递增 `seq`、再换 id，player 可能在 gateway 还没
+        #   处理完 `endpoint.register` 时就打出第一个动作 —— 那个动作会被
+        #   gateway 按**旧** instance 钉住，而我们的 handler 已经换成新 id，
+        #   于是路由校验失败。放在 `seq` 之前，注册请求至少已经发出去，
+        #   加上 player 侧「轮询间隔（≥1 s）+ 沙箱创建（≈1.3 s）+ initialize」
+        #   这段延迟，gateway 有充足时间处理完。
+        #
+        #   为什么换：一次丢包会让 gateway 的 `max_concurrency = 1` 并发围栏永久
+        #   占死（详见 `plan/Track2_丢包自锁修复方案.md`）。换 id 触发 gateway 的
+        #   `mark_instance_ambiguous`，把围栏要回来 —— 最坏情况从「本轮 run 剩下
+        #   的全部 episode 都废」缩到「1 个 episode 受损」。
+        #
+        #   钩子由 `node.py` 注入（它持有 handler 与所有 register 路径）；
+        #   取不到就跳过（手工起的裸 endpoints，自检场景，不影响）。
         self._initial_physical = self._session.adapter.get_final_state()
         self._initial_layout = self._session.adapter.get_layout()
+        hook = getattr(self, "on_episode_started", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception:                                   # noqa: BLE001
+                # 换 id 失败**不该让 episode 起不来** —— 它只是止血手段，
+                # 不是正确性前提；真失败会在后续的 503 上暴露。
+                pass
         # `seq` 单调递增 —— **player 节点靠它判断「有新 episode 了」**（B4）。
         # 不用 `(case_id, seed)` 比对：同一个 seed 重跑是合法操作。
         #
@@ -417,6 +450,13 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             "durations_s": durations,
             "by_operation": by_operation,
             "unfinished_or_rejected": unfinished,
+            #: provider **实际收到过**的 invoke 请求数（记录在 `start()` 里建）。
+            #:
+            #: 判据 `received == count + unfinished_or_rejected` 恒成立 ——
+            #: 所以它能与裁判侧的「客户端 202 次数」对照，抓出**纯丢包**
+            #: （请求在 dora 通道上丢了，provider 连记录都没建）。
+            #: 见 `plan/Track2_丢包自锁修复方案.md` §3.2 的盲区说明。
+            "received": len(records),
             "action_timeout_s": float(getattr(self._config, "action_timeout_s", 0.0)),
             "action_timeout_source": str(
                 getattr(self._config, "action_timeout_source", "")),
@@ -686,6 +726,30 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
     async def status(self, key: ToolExecutionKey) -> ToolExecutionStatus:
         record = self._executions.get(key.invocation_id)
         if record is None:
+            # ★ ②-A2（2026-10-18）：**这是「我从未收到过这条 invocation」的正面证据。**
+            #
+            #   只有三种可能走到这里：
+            #     1. 客户端问了一个不存在的 invocation_id（几乎不可能）；
+            #     2. 这条 invoke 请求在 gateway → provider 的 dora 通道上**被丢了**
+            #        —— 正是丢包自锁的那个成因；
+            #     3. 我们刚换了 instance id，这条属于**旧** instance。
+            #
+            #   第 3 种其实到不了这里：换 id 后 handler 的 `validate_route` 会先用
+            #   `FORGE_PROTOCOL_ROUTE_MISMATCH` 把旧 instance 的请求拒掉，不会进
+            #   到 `status()`。所以到这里基本就是第 2 种。
+            #
+            #   交给 `node.py` 的钩子去**节流地换 instance id** —— 换 id 会触发
+            #   gateway 的 `mark_instance_ambiguous`，把被占死的并发围栏释放掉，
+            #   后续动作立刻恢复（A1 只能把损失限制在一个 episode，A2 能让它自愈）。
+            #
+            #   ⚠️ **必须节流**：一个陌生 invocation 会被反复轮询（客户端 5 s 超时
+            #   内每 50 ms 一次），不节流会引发注册风暴。
+            hook = getattr(self, "on_unknown_invocation", None)
+            if hook is not None:
+                try:
+                    hook(key.invocation_id)
+                except Exception:                               # noqa: BLE001
+                    pass
             # 官方模型要求：`unknown` / `failed` 相位**必须**带 error
             return ToolExecutionStatus(
                 phase="unknown",

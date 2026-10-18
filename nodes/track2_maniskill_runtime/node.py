@@ -124,10 +124,26 @@ class RuntimeNode:
 
     def __init__(self, config: RuntimeConfig):
         self.config = config
+        # ★ ②-A1（2026-10-18）：instance id 的轮换计数与锁。
+        #
+        #   换 episode 时 `_rotate_instance_id()` 会把 `self.config` 换成带新
+        #   `endpoint_instance_id` 的新实例（`RuntimeConfig` 是 frozen 的），
+        #   并同步给 endpoints 与 handlers —— 三处**必须同时换**，否则
+        #   gateway 按新 instance 钉住的请求会被 provider 按旧 instance 拒掉。
+        self._instance_epoch = 0
+        self._instance_lock = threading.Lock()
+        #: A2 的节流闸（见 `_on_unknown_invocation`）。0 = 还没换过。
+        self._last_unknown_rotate = 0.0
         self.node = Node()
         self.endpoints = Track2SimulationEndpoints(
             adapter_factory=self._build_adapter, config=config,
             frame_sink=self._publish_frame)
+        # episode 真正开始时（`_reset_blocking` 收尾）触发换 id —— 那时本
+        # episode 的 provider 侧工作已结束、且下一轮还没开始，没有在飞的动作。
+        self.endpoints.on_episode_started = self._rotate_instance_id
+        # A2：被问到「不认识的 invocation」时也换一次（节流）—— 那正是
+        # 「这条 invoke 在 dora 通道上被丢了」的正面证据。
+        self.endpoints.on_unknown_invocation = self._on_unknown_invocation
 
         # provider 侧 handler：每个 endpoint 一个（官方约定）
         self.handlers: dict[str, ToolEndpointHandler] = {}
@@ -203,6 +219,78 @@ class RuntimeNode:
         return adapter
 
     # ── 注册与续租
+
+    def _rotate_instance_id(self) -> None:
+        """②-A1：换一个新的 `endpoint_instance_id` 并重新注册。
+
+        由 `endpoints._reset_blocking` 在**每个 episode 开始**时回调。
+        目的见 `plan/Track2_丢包自锁修复方案.md` §4：一次丢包会永久占死
+        gateway 的 `max_concurrency = 1` 并发围栏，而**换 id 是唯一能让
+        gateway 释放它的方式**（`mark_instance_ambiguous`）。
+
+        ⚠️ **三处必须同时换**：`self.config`（register 与 renew 读它）、
+        handler 的 `_endpoint_instance_id`（官方 handler 用它对请求做路由校验，
+        见 `forge_tool/handler.py` 的 `validate_route`）、以及后续所有
+        `endpoint.register` 请求体。漏任何一处 → 请求被
+        `FORGE_PROTOCOL_ROUTE_MISMATCH` 拒掉，比不换更糟。
+
+        ⚠️ handler 的 `endpoint_instance_id` 是**只读 property**（无 setter），
+        所以直接写它的私有字段 `_endpoint_instance_id` —— 这是官方结构里
+        唯一能改的落点。那个字段就是 `__init__` 里存进去的同一个。
+        """
+        from .config import rotate_instance_id
+
+        with self._instance_lock:
+            self._instance_epoch += 1
+            new_config = rotate_instance_id(self.config, self._instance_epoch)
+            new_id = new_config.endpoint_instance_id
+            self.config = new_config
+            # endpoints 也要拿到新 config（它读 `_config` 的地方不含 id，
+            # 但保持一致，避免将来有人从它那里读 id 踩坑）
+            self.endpoints._config = new_config
+            for handler in self.handlers.values():
+                try:
+                    handler._endpoint_instance_id = new_id
+                except Exception:                               # noqa: BLE001
+                    pass
+        # 立刻注册新 id（不等下一个 renew 周期）—— 早一步让 gateway 把旧的
+        # 放进 `removed`，围栏就早一步释放。
+        self.register_once()
+        # ⚠️ **无条件**记一行 —— 不能走 `_log()`（它要 `TRACK2_LOG`，而
+        #    `dora start --detach` 下节点由长命 daemon spawn，daemon 环境里
+        #    没有 `TRACK2_LOG`，实测日志里一行都没有）。
+        #    这一行是 A1 唯一的外部可观测证据：「轮换到底发生了吗」。
+        #    低频（每 episode 一次），不会刷屏。
+        print(f"[track2-runtime] instance id → {new_id}（②-A1 轮换，释放并发围栏）",
+              file=sys.stderr, flush=True)
+
+    #: A2：两次「因陌生 invocation 而换 id」之间的最小间隔（秒）。
+    #
+    # 客户端在 5 s 超时内会每 50 ms 轮询一次 status → 一个丢包会触发上百次
+    # 回调。不节流会引发注册风暴（每次换 id 都要重注册 2 个 endpoint）。
+    # 10 s 的取值：大于客户端单次动作超时（5 s）、小于一个 episode 的典型时长，
+    # 所以「一次丢包最多引发一次换 id」，而下一个丢包仍能被救。
+    UNKNOWN_ROTATE_COOLDOWN_S = 10.0
+
+    def _on_unknown_invocation(self, invocation_id: str) -> None:
+        """A2：provider 收到「不认识的 invocation」时换 id（节流）。
+
+        由 `endpoints.status()` 回调 —— 那条路径是「这条 invoke 请求我从未收到」
+        的**正面证据**（丢包的典型形态）。换 id 会触发 gateway 的
+        `mark_instance_ambiguous`，释放被占死的并发围栏，后续动作立刻恢复。
+
+        ⚠️ 与 A1（每 episode 换）的分工：A1 保证「最多坏一个 episode」，
+        A2 让坏掉的那个 episode **中途也能恢复**。两者**同时开着**是最优的
+        —— A1 兜底、A2 提速。
+        """
+        now = time.monotonic()
+        with self._instance_lock:
+            if now - self._last_unknown_rotate < self.UNKNOWN_ROTATE_COOLDOWN_S:
+                return
+            self._last_unknown_rotate = now
+        self._log_always(
+            f"未知 invocation {invocation_id[:24]}… → 换 instance id 释放围栏")
+        self._rotate_instance_id()
 
     def register(self) -> None:
         for route in ROUTES.values():
@@ -382,6 +470,14 @@ class RuntimeNode:
     def _log(self, message: str) -> None:
         if os.environ.get("TRACK2_LOG"):
             print(f"[track2-runtime] {message}", file=sys.stderr, flush=True)
+
+    def _log_always(self, message: str) -> None:
+        """无条件打一行（不依赖 `TRACK2_LOG`）。
+
+        只给**低频、且是修复效果的唯一证据**的事件用（如 A2 触发的轮换）——
+        常规调试日志仍走 `_log()`，否则会刷屏。
+        """
+        print(f"[track2-runtime] {message}", file=sys.stderr, flush=True)
 
     def _run_async(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(
