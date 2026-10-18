@@ -101,6 +101,19 @@ class _Execution:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+#: 结束一个 episode 的《终止事件名》，与 forge_tool 的映射一致（见 `_emit_terminal`）。
+class _StrictJsonError(ValueError):
+    """Oracle plan 里出现了 NaN / Infinity —— `json.loads` 会接受，下游 schema 不认。"""
+
+
+def _strict_json(value: Any) -> None:
+    import json as _json
+    try:
+        _json.loads(_json.dumps(value, allow_nan=False))
+    except ValueError as exc:
+        raise _StrictJsonError(str(exc)) from None
+
+
 class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
     """两个 endpoint 的实现。用**同一个实例**，因为都碰同一个仿真环境。
 
@@ -231,6 +244,11 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
                                     case_id=case_id,
                                     camera=self._config.camera_required)
 
+        # ★ G2：Oracle 规划开着时，公开输入的白名单要多放一个 `oracle_plan`
+        #   （payload 在 reset 之后才算得出来，见下面那段）。普通评测没有它。
+        oracle_on = bool(getattr(self._config, "oracle_planning", False))
+        public_fields = tuple(public) + (('oracle_plan',) if oracle_on else ())
+
         # `final` 要给 P5 事件证据（`candidate_runner` 里 recovery 与 checkpoints
         # 就是这么来的）—— 没有它 judge_snapshot 的 `physics_health` / P5 是
         # 「NOT CONFIGURED」，评分侧会缺证据。
@@ -258,7 +276,7 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             self._session = build_case_session(
                 bundle, self._bank(), seed,
                 camera=self._config.camera_required,
-                public_fields=tuple(public),
+                public_fields=public_fields,
                 live=True,
                 checkpoints=checkpoints,
                 recovery=recovery,
@@ -270,6 +288,19 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             self._adapter = self._session.adapter
 
         self._session.reset(seed, public_task_inputs=public)
+
+        # ★ G2：Oracle 通道。规划**必须在 reset 之后**（env 要有本 episode 的
+        #   初始布局），但裁判在常驻结构下没有 env —— 所以在这里做。
+        #
+        #   与 legacy（`select_case.py` 的 `_planning_factory`）同款地 reset 两次：
+        #   第一次不带 plan（只为拿到 env），规划完再带 plan reset 一次。
+        #   两次用的是**同一个 adapter / 同一个 bundle / 同一个 seed**，
+        #   所以规划看到的物理与选手执行时的初始状态是同一个。
+        #   `initial_*` 快照在**第二次 reset 之后**才采（见下）。
+        if oracle_on:
+            plan = self._oracle_plan_blocking(case_id)
+            public = {**public, "oracle_plan": plan}
+            self._session.reset(seed, public_task_inputs=public)
         # ★ **reset 之后立刻**采一份物理真值（B2'）。
         #
         #   为什么必须在这里采：判分要 `initial_layout` —— 那是「选手动手**之前**
@@ -346,6 +377,92 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             # 悄悄变成「证据缺失却通过」。
             "event_evidence": self._event_evidence(),
         }
+
+    def judge_timings(self) -> dict:
+        """**Judge-only**：本 flow 至今所有 Action 的执行耗时（Q14 的数据源）。
+
+        ## 为什么需要它
+
+        `runtime.yaml` 的 `action_timeout_s` 现在是 `30.0`，标着
+        `PROVISIONAL_PENDING_MEASUREMENT`（Q14 要求「用 73 case 实测动作耗时后确定」）。
+        **数据其实一直在采**（`_run_action` 里每次都记 `started_at_s` /
+        `finished_at_s`），只是没有任何出口 —— 于是「标定 Q14」看起来要专门跑一轮。
+
+        加这个只读出口之后，全量验收跑（73 case）**顺带**就把分布采回来了。
+
+        ## 边界
+
+        * 只暴露**耗时**（秒），不含任何 GT / 位姿 / 目标信息
+        * `_executions` 跨 episode 累积（`reset` 不清它）—— 这正是我们要的：
+          整轮 flow 的分布，而不是单 episode 的
+        * 走**私有控制口**，选手够不着（沙箱无网络，见 B5）
+        """
+        with self._execution_lock:
+            records = list(self._executions.values())
+        durations: list[float] = []
+        by_operation: dict[str, list[float]] = {}
+        unfinished = 0
+        for record in records:
+            start = getattr(record, "started_at_s", None)
+            finish = getattr(record, "finished_at_s", None)
+            if start is None or finish is None:
+                unfinished += 1
+                continue
+            delta = float(finish) - float(start)
+            durations.append(delta)
+            by_operation.setdefault(record.operation, []).append(delta)
+        return {
+            "count": len(durations),
+            "durations_s": durations,
+            "by_operation": by_operation,
+            "unfinished_or_rejected": unfinished,
+            "action_timeout_s": float(getattr(self._config, "action_timeout_s", 0.0)),
+            "action_timeout_source": str(
+                getattr(self._config, "action_timeout_source", "")),
+        }
+
+    def _oracle_plan_blocking(self, case_id: str) -> dict:
+        """在当前（已 reset 的）env 上做一次 GT 规划（G2）。
+
+        ## 为什么规划搬到这里
+
+        常驻结构下**裁判进程没有 env** —— env 在 runtime 节点里。所以
+        `release_entry.py` 原来那句
+        `raise ORACLE_PLAN_NOT_AVAILABLE_ON_RESIDENT_CHAIN` 是对的：
+        在裁判侧根本做不了规划。
+
+        但 runtime 节点**本来持有的就是执行选手代码的那个 env**，
+        比 legacy 那条路（`select_case.py` 里 factory 现造一个）**更正确** ——
+        规划看到的物理与选手执行时的初始状态**就是同一个**，不需要靠
+        「两次 reset 用同一个 adapter」来论证。
+
+        ## 只由 `_reset_blocking` 调用
+
+        时机是硬的：必须在 `reset` **之后**（env 要有本 episode 的初始布局）、
+        且在该 episode 的公开输入**定稿之前**（payload 要进 `oracle_plan` 字段）。
+        所以它不是一条独立路由，而是 reset 内部的一步。
+        规划**只读 env、不写** —— 选手面对的物理状态不受影响。
+
+        ⚠️ 只有 `config.oracle_planning=True` 时才走到这里（见 `_reset_blocking`）。
+        """
+        from track2_judge.oracle.planning import (
+            build_oracle_plan, find_target, oracle_executor_payload, serializable)
+
+        adapter = self._require_adapter()
+        bundle = self._load_bundle(case_id)
+        task = bundle["contract"]
+        # ⚠️ env 是私有属性，但这里是**同包裁判侧**访问 —— 与
+        #    `select_case.py` 的 `_planning_factory` 走的是同一个口子。
+        env = getattr(adapter, "_ManiSkillSimulatorAdapter__env", None)
+        if env is None:
+            raise ToolError(code="TRACK2_ORACLE_NO_ENV",
+                            message="oracle planning needs a reset environment",
+                            retryable=False)
+        plan = build_oracle_plan(env, task, find_target(task))
+        payload = serializable(oracle_executor_payload(plan))
+        # 与 legacy 同款：先序列化，再挡一道 NaN/Infinity（JSON 允许，下游不接受）
+        _strict_json(payload)
+        return payload
 
     def _event_evidence(self) -> dict:
         """按本 case 真正启用的约束集采事件证据。

@@ -95,6 +95,13 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:                            # noqa: BLE001
                 return self._reply(500, {"error": type(exc).__name__,
                                          "message": str(exc)[:300]})
+        if self.path == "/episode/timings":
+            # Q14：动作耗时分布。**只读**，不含 GT / 位姿 / 目标信息。
+            try:
+                return self._reply(200, server.timings())
+            except Exception as exc:                            # noqa: BLE001
+                return self._reply(500, {"error": type(exc).__name__,
+                                         "message": str(exc)[:300]})
         return self._reply(404, {"error": "unknown path"})
 
     def do_POST(self):                                          # noqa: N802
@@ -167,6 +174,10 @@ class JudgeControlServer:
 
     def snapshot(self) -> dict:
         return self._endpoints.judge_snapshot()
+
+    def timings(self) -> dict:
+        """Q14：本 flow 至今所有 Action 的执行耗时分布。"""
+        return self._endpoints.judge_timings()
 
     # ── 生命周期
 

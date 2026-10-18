@@ -40,9 +40,20 @@ lease_renew_interval_s: 5.0
 #
 # >0 时 runtime 节点在 loopback 上开一个只给裁判用的 HTTP 口：
 #   POST /episode/reset     换 episode（case/seed/mode）
+#   POST /episode/next_attempt  同一 episode 内追加一次 run()（final 的第 2/3 次）
 #   GET  /episode/snapshot  judge-only 真值（选手够不到 —— 沙箱无网络）
+#   GET  /episode/timings   本 flow 至今所有 Action 的耗时分布（Q14 数据源）
 #
 # ⚠️ 走**配置**而不是环境变量：`dora start --detach` 下节点由长命的
 #    dora daemon spawn，daemon 环境里没有评测时设的变量 —— 用环境变量
 #    会静默地不开控制口。裁判侧逐次渲染本文件，端口一定到得了。
 judge_control_port: 0
+
+# 裁判侧 Oracle 的 GT 规划（G2）。**默认关** —— 普通评测不许开。
+#
+# 开着时 `_reset_blocking` 会在**它自己的 env** 上做一次 GT 规划
+# （规划只读 env、不写），把 payload 经公开输入的 `oracle_plan` 字段下发给
+# 沙箱里的 oracle skill。选手包拿不到它（白名单逐次构造）。
+#
+# ⚠️ 与 judge_control_port 同理：由裁判侧渲染本文件打开，不走环境变量。
+oracle_planning: false

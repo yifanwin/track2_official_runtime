@@ -52,7 +52,21 @@ class RuntimeConfig:
     # 相机是否必需。**第 5 步起默认 True** —— 模式 B（Q4）下原始图文是
     # 选手唯一的感知来源，没有相机这条链路就不成立。
     # 保留开关是为了诊断场景（`camera_required=false` 时不建相机，跑得更快）。
+    #
+    # ⚠️ 2026-10-17（G3）：这个字段以前**没有生效路径** —— 评测器的
+    #    `--no-camera` 把开关传到 `ResidentRunner` 就断了。现在
+    #    `PersistentFlow.start()` 会把它渲染进本文件，所以它**真的管用**。
     camera_required: bool = True
+
+    # ── 裁判侧 Oracle 的 GT 规划（G2）
+    #
+    # 默认 **False**：普通评测**不规划**，选手的公开输入里不会出现 `oracle_plan`。
+    # 只有 `release_entry.py --oracle-plan auto`（或显式渲染本项）时才开。
+    #
+    # 开了之后，`_reset_blocking` 会在**它自己的 env** 上跑一次 GT 规划
+    # （规划只读 env，不写），把 payload 经公开输入的 `oracle_plan` 字段下发给
+    # 沙箱里的 oracle skill。选手包拿不到它（白名单逐次构造）。
+    oracle_planning: bool = False
 
     # ── provider 注册
     endpoint_instance_id: str = ""
@@ -97,7 +111,7 @@ _KEYS = {
     "case_id", "seed", "casebank", "max_steps", "max_sim_time_s",
     "max_concurrency", "action_timeout_s", "stop_confirm_timeout_s",
     "camera_required", "text_instruction", "endpoint_instance_id",
-    "lease_renew_interval_s", "judge_control_port",
+    "lease_renew_interval_s", "judge_control_port", "oracle_planning",
 }
 
 
