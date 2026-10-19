@@ -691,11 +691,26 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             else:
                 raise RuntimeError(f"no executor bound for {record.operation}")
 
-            payload = {"control_steps": int(raw.get("control_steps", 0)),
-                       "sim_time_s": float(raw.get("sim_time_s", 0.0)),
-                       "executed_steps": int(raw.get("executed_steps", 0))}
-            schema_mod.validate_output(
-                _tool_id_for(record.endpoint_id, record.operation), payload)
+            # ★ 2026-10-19 字段语义统一 + 键名修正（见
+            #   `plan/Track2_字段语义统一_修复方案.md`）。
+            #
+            #   1. `control_steps` 一律是 **episode 累计**（与 `observe` 同义）；
+            #      本次真走了几步在 `executed_steps` 里。
+            #   2. **`executed_steps` 只在该 ToolSpec 声明了它时才带** ——
+            #      `joint_trajectory` 有、`gripper_control` 没有，而两个 spec
+            #      都是 `additionalProperties: false`（多一个键 = 校验失败）。
+            #      修前这里无条件带上它，导致 **gripper_control 每次调用都被拒**。
+            #   3. adapter 的 `observe()` 用的键名是 `simulation_time_s`，
+            #      对外协议名是 `sim_time_s` —— 修前这里只读后者，
+            #      于是 gripper 返回的 `sim_time_s` **恒为 0**。两个都认。
+            tool_id = _tool_id_for(record.endpoint_id, record.operation)
+            steps = int(raw.get("control_steps", 0))
+            sim_time = float(raw.get("sim_time_s",
+                                     raw.get("simulation_time_s", 0.0)))
+            payload = {"control_steps": steps, "sim_time_s": sim_time}
+            if "executed_steps" in _declared_output_keys(tool_id):
+                payload["executed_steps"] = int(raw.get("executed_steps", 0))
+            schema_mod.validate_output(tool_id, payload)
             with record.lock:
                 record.result = ToolResult(status="succeeded", outputs=payload)
                 record.phase = _PHASE_COMPLETED
@@ -758,8 +773,8 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             adapter.step({"joint_position": list(item["joint_position"]),
                           "gripper_opening_m": float(item["gripper_opening_m"])})
             executed += 1
-        return {"control_steps": executed,
-                "sim_time_s": executed * adapter.control_timestep,
+        return {"control_steps": adapter.control_steps,
+                "sim_time_s": adapter.control_steps * adapter.control_timestep,
                 "executed_steps": executed}
 
     def _emit_terminal(self, record: "_Execution", event_type: str) -> None:
@@ -922,6 +937,24 @@ def _tool_id_for(endpoint_id: str, operation: str) -> str:
             retryable=False,
         )
     return tool_id
+
+
+def _declared_output_keys(tool_id: str) -> frozenset:
+    """该 ToolSpec 的 `output_schema` 声明了哪些键。
+
+    用途见 `_run_action`：**只有声明过的键才能出现在 payload 里** ——
+    两个 Action spec 都是 `additionalProperties: false`，多带一个键会被
+    `validate_output` 直接拒掉（2026-10-19 前 `gripper_control` 就栽在这上面）。
+
+    取不到（spec 不存在/形状意外）时返回**空集**，即「一个可选键都不带」——
+    宁可少带（schema 只要求必填项），不要多带而被拒。
+    """
+    try:
+        from track2_judge.toolapi import schema as _schema
+        spec = _schema.SPECS[tool_id]
+        return frozenset((spec.get("output_schema") or {}).get("properties") or {})
+    except Exception:                                           # noqa: BLE001
+        return frozenset()
 
 
 def _shape_observation(raw: dict, *, include_rgb: bool) -> dict:
