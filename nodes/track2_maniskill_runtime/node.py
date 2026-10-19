@@ -182,20 +182,48 @@ class RuntimeNode:
     # ── 适配器（物理）
 
     def _build_adapter(self):
-        """在 executor 线程里建场景。**不在 event loop 里做。**"""
-        # ⚠️ 相机档要先**预热 CUDA 上下文**。SAPIEN 的 `Device("cuda:0")`
-        #    在 CUDA 尚未初始化时会报 `failed to find device "cuda:0"`，
-        #    而 ManiSkill 的 backend 解析发生得比 torch 的初始化更早。
-        #    碰一下 torch 就够了（见 work/reports/54_pitfalls.md 的 F0）。
+        """在 executor 线程里建场景。**不在 event loop 里做。**
+
+        ⚠️ **调用顺序有硬约束**（见下面三段注释）：先 import（会清空
+        `CUDA_VISIBLE_DEVICES`）→ 再设本 worker 的 GPU → 最后才预热 CUDA
+        并建 scene。顺序错了 GPU 绑定就静默失效（实测：渲染全落物理卡 0）。
+        """
+        # ① 惰性 import：建场景要把 mani_skill/sapien/torch 全拉起来，很慢。
+        #    ⚠️ 这一步会**连带 import `prototype_env`**（经 `select_case`），
+        #    而它在 import 时把 `CUDA_VISIBLE_DEVICES` 清空（CPU 档约定，
+        #    `prototype_env.py:5`）。所以「设 GPU」必须排在**这一步之后**。
+        from track2_judge.cli.select_case import CASEBANK, REFERENCE_ROOT
+        from track2_judge.scenario.session import build_case_session
+
+        # ② ★ 2026-10-19 并行化（八卡）：把本 worker 的 GPU 定下来。
+        #
+        #   **必须在任何 CUDA 初始化之前** —— `torch`/SAPIEN 一旦初始过，
+        #   可见设备列表就固定了，再改 `CUDA_VISIBLE_DEVICES` 无效
+        #   （实测：改在预热之后 ⇒ 两路仍全落卡 0）。
+        #
+        #   取值**走配置**（`runtime.yaml` 的 `render_gpu`），不走环境变量：
+        #   `--detach` 下节点由长命 daemon spawn，daemon 环境里没有 `TRACK2*`
+        #   （实测），走环境变量会**静默地**不生效。裁判侧按 worker 渲染本项。
+        #
+        #   为什么必须设：`env_factory` 写死 `render_backend='sapien_cuda:0'`，
+        #   而 `cuda:0` 是「`CUDA_VISIBLE_DEVICES` 里的第 0 个」；为空时落回
+        #   **物理卡 0**。8 路全挤卡 0 ⇒ 物理步变慢 ⇒ action 撞 5 s 超时
+        #   ⇒ 围栏槽位不释放 ⇒ `concurrency 1 exhausted`（同因两症）。
+        _gpu = str(getattr(self.config, "render_gpu", "") or "").strip()
+        if _gpu:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _gpu
+
+        # ③ 预热 CUDA 上下文（此时才初始化 ⇒ 看到的就是本 worker 的卡）。
+        #    SAPIEN 的 `Device("cuda:0")` 在 CUDA 尚未初始化时会报
+        #    `failed to find device "cuda:0"`，而 ManiSkill 的 backend 解析
+        #    发生得比 torch 的初始化更早。碰一下 torch 就够了
+        #    （见 work/reports/54_pitfalls.md 的 F0）。
         if self.config.camera_required:
             try:
                 import torch
                 torch.zeros(1, device="cuda:0")
             except Exception:                                  # noqa: BLE001
                 pass
-        # 惰性 import：建场景要把 mani_skill/sapien/torch 全拉起来，很慢
-        from track2_judge.cli.select_case import CASEBANK, REFERENCE_ROOT
-        from track2_judge.scenario.session import build_case_session
 
         bank = Path(self.config.casebank) if self.config.casebank else CASEBANK
         case_file = bank / "cases" / self.config.case_id / "case.json"

@@ -107,8 +107,7 @@ class PlayerConfig:
         env = os.environ if env is None else env
         self.profile = (env.get("PAOS_SKILL_PROFILE") or "sim").strip() or "sim"
         self.bundle_root = Path(env.get("PAOS_SKILL_ROOT") or ".").expanduser()
-        self.gateway_url = (env.get("TRACK2_GATEWAY_URL")
-                            or "http://127.0.0.1:19110").strip()
+        self.gateway_url = self._gateway_url(env)
         default_player = self.bundle_root / "profiles" / self.profile / "player"
         self.player_dir = Path(
             env.get("TRACK2_PLAYER_DIR") or default_player).expanduser()
@@ -120,6 +119,43 @@ class PlayerConfig:
         # Judge 私有控制口的地址（B1/B4）。**不给 = 空串 = 关闭常驻**，
         # 此时跑完一次 `run_episode()` 就空转 —— 回归/单例评测依赖这个行为。
         self.control_url = self._control_url(env)
+
+    def _gateway_url(self, env: dict[str, str]) -> str:
+        """gateway 的 URL。**环境变量 → Bundle 文件 → 默认**三级。
+
+        ⚠️ **2026-10-19 加文件兜底（并行必需）**。
+
+        以前只读 `TRACK2_GATEWAY_URL`，读不到就硬编码回退 `19110`。但：
+        `dora start --detach` 下节点由**长命 dora daemon** spawn，daemon
+        环境里 0 个 `TRACK2*`（与 `_control_url` 同一条教训）——
+        实测节点 `/proc/<pid>/environ` 里**没有** `TRACK2_GATEWAY_URL`。
+
+        ⇒ 8 路并行时，每个 worker 的 gateway 各自监听 19110/19120/…，
+        但 **player 全部去连 19110** ⇒ 除 w0 外全部
+        `PlayerConfigError: gateway at http://127.0.0.1:19110 never became ready`。
+
+        兜底来源用**本 worker 的 `gateway.yaml`**（`run_player.sh` 已把
+        `TRACK2_PROFILE_DIR=$(pwd)` 设成该 profile 目录）—— 那个文件里
+        的 `port:` 是端口**唯一真源**（裁判侧按 worker 渲染），
+        所以 player 与 gateway 必然一致。
+        """
+        url = (env.get("TRACK2_GATEWAY_URL") or "").strip()
+        if url:
+            return url
+        # 文件兜底：读本 profile 的 gateway.yaml 的 `port:`
+        import re as _re
+        profile_dir = Path(env.get("TRACK2_PROFILE_DIR")
+                           or (self.bundle_root / "profiles" / self.profile))
+        try:
+            text = (profile_dir / "gateway.yaml").read_text(encoding="utf8")
+            m = _re.search(r"^port:\s*(\d+)\s*$", text, flags=_re.MULTILINE)
+            if m:
+                host = (env.get("TRACK2_GATEWAY_HOST") or "127.0.0.1").strip()
+                return f"http://{host}:{int(m.group(1))}"
+        except (OSError, ValueError):
+            pass
+        # 最后才回退默认（单例/回归形态，Bundle 未改端口）
+        return "http://127.0.0.1:19110"
 
     def _control_url(self, env: dict[str, str]) -> str:
         """从环境变量**或** Bundle 里的控制口文件取端口。

@@ -30,6 +30,16 @@ stop_confirm_timeout_s: 5.0     # Q13：「等 backend 确认真实停止」的�
 # 诊断场景（只想量物理）可以设 false —— 那时不建相机、跑得更快。
 camera_required: true
 
+# 渲染用的物理 GPU 卡号（八卡并行）。空/0 = 原行为。
+#
+# `env_factory` 写死 `render_backend='sapien_cuda:0'`，而 `cuda:0` 是
+# 「`CUDA_VISIBLE_DEVICES` 里的第 0 个」。8 路并行时若不设，全部落回物理卡 0。
+# 裁判侧按 worker 渲染本项（w<k> → GPU k）。
+#
+# ⚠️ 走**配置**不走环境变量：`--detach` 下节点由长命 daemon spawn，
+#    daemon 环境里没有 `TRACK2*` —— 用环境变量会静默地不生效。
+render_gpu: "0"
+
 # 给选手的自然语言指令（公开输入之一，不含任何答案）
 text_instruction: "Move the target object to the position shown in the reference image."
 

@@ -58,6 +58,21 @@ class RuntimeConfig:
     #    `PersistentFlow.start()` 会把它渲染进本文件，所以它**真的管用**。
     camera_required: bool = True
 
+    # 渲染用的**物理 GPU 卡号**（八卡并行，2026-10-19）。
+    #
+    # 为什么需要它：`env_factory` 写死 `render_backend='sapien_cuda:0'`，
+    # 而 `cuda:0` 指的是「`CUDA_VISIBLE_DEVICES` 里的第 0 个」。串行时
+    # 无所谓；**8 路并行时若不设，全部落回物理卡 0** ⇒ 物理步变慢 ⇒
+    # action 撞 5 s 超时 ⇒ 围栏槽位不释放 ⇒ `concurrency 1 exhausted`。
+    #
+    # ⚠️ 走**配置**而不是环境变量：与 `camera_required` / `judge_control_port`
+    # 同因 —— `--detach` 下节点由长命 daemon spawn，daemon 环境里没有
+    # `TRACK2*`。裁判侧按 worker 渲染本项。
+    #
+    # 语义：节点用它设 `CUDA_VISIBLE_DEVICES`，让 `sapien_cuda:0` 落在该卡。
+    # 空/0 = 不改变原行为。
+    render_gpu: str = "0"
+
     # ── 裁判侧 Oracle 的 GT 规划（G2）
     #
     # 默认 **False**：普通评测**不规划**，选手的公开输入里不会出现 `oracle_plan`。
@@ -131,6 +146,7 @@ _KEYS = {
     "max_concurrency", "action_timeout_s", "stop_confirm_timeout_s",
     "camera_required", "text_instruction", "endpoint_instance_id",
     "lease_renew_interval_s", "judge_control_port", "oracle_planning",
+    "render_gpu",
 }
 
 
