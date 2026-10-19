@@ -37,7 +37,11 @@ metadata: {"PhyAgentOS":{"always":true,"requires":{"runtime":["track2-official-r
   `images.camera_status` 是**运行事实**（拍到没拍到），不是目标答案；
   拍失败时 `camera` **不会**给上一帧（避免你把过期画面当新的）。
 
-**夹爪开度**从关节位置推：`gripper_opening_m = joint_position[6] - joint_position[7]`。
+**夹爪开度**从关节位置推：`gripper_opening_m = joint_position[6] - joint_position[7]`（**差，不是和**）。
+
+> ⚠️ **读错一个符号就整 case 归零**：初始两指是 `[+0.04, -0.04]`，真实开度 `0.04-(-0.04)=0.08 m`；
+> 写成 `+` 会得到 `0.00`，第一次下发即与物理差 `0.08 m` > 单步限幅 `0.006 m` →
+> `target slew exceeded` → **Gate BLOCKED、全盘 0 分**。
 
 ## 怎么控制机器人
 

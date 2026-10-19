@@ -5,7 +5,7 @@
 # 选手不允许修改它。
 manifest_version: 2
 name: track2-official-runtime
-version: "0.3.1"
+version: "0.3.2"
 description: Track 2 official ManiSkill Tool runtime (observe / joint_trajectory / gripper_control).
 skill_document: SKILL.md
 
