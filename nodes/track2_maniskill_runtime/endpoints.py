@@ -44,6 +44,7 @@ import asyncio
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -77,6 +78,10 @@ _PHASE_COMPLETED = "completed"
 _PHASE_FAILED = "failed"
 _PHASE_CANCELLED = "cancelled"
 _PHASE_UNKNOWN = "unknown"
+
+#: 幂等守卫保留的最近 key 数（见 `start()`）。远大于「一条在飞请求的重复投递」
+#: 所需的重叠窗口（重复投递发生在毫秒级），所以不会误放行。
+_STARTED_KEY_KEEP = 4096
 
 
 @dataclass
@@ -147,6 +152,11 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         #: 当前 case 的 bundle（`_constraints()` 要用它挑事件约束）
         self._bundle_cache: dict | None = None
         self._executions: dict[str, _Execution] = {}
+        #: 幂等守卫（2026-10-19）：已 `start()` 过的完整 `ToolExecutionKey`
+        #: 集合，按 `(invocation_id, attempt_id)` 去重。
+        #: 有界 —— 只保留最近 `_STARTED_KEY_KEEP` 个（用 OrderedDict 当 FIFO），
+        #: 免得长跑（250 episode × 多动作）无上限增长。
+        self._started_keys: "OrderedDict[ToolExecutionKey, None]" = OrderedDict()
         self._execution_lock = threading.Lock()
         # Q9：物理串行化。max_workers=1 保证任何时候只有一个东西在碰 env。
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="track2-physics")
@@ -622,10 +632,33 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             raise _rejected(f"schema rejected: {exc}") from None
 
         key = context.execution_key
-        execution = _Execution(endpoint_id=context.endpoint_id,
-                               operation=context.operation, key=key,
-                               arguments=arguments)
+        # ★ 2026-10-19 幂等守卫：**同一个 (invocation_id, attempt_id) 只执行一次物理动作**。
+        #
+        #   背景：②-A2b 的「对齐旧 instance id 重投」（`node.py`）会让一条在飞请求
+        #   再走一遍本函数。若 dora 对同一输入做「至少一次」重复投递（同一条 arrow
+        #   ⇒ 同 invocation_id **且**同 attempt_id），物理动作就会被**执行两次**
+        #   —— 比超时更糟。dora 实测表现为丢包（不是重复），故概率极低；
+        #   但守卫本身无副作用。
+        #
+        #   ⚠️ 键取**完整** `ToolExecutionKey`（invocation_id + attempt_id），
+        #      **不是**只有 invocation_id —— gateway 对同一 invocation 的**合法
+        #      重试**会换 attempt_id，那种必须放行（否则动作静默不执行，更糟）。
+        #      官方 handler 自己也是按这个二元组索引 execution 的
+        #      （`forge_tool/handler.py:399` `_execution_key`）。
+        dedup_key = key  # `ToolExecutionKey` 是 frozen dataclass，可哈希；含 attempt_id
         with self._execution_lock:
+            if dedup_key in self._started_keys:
+                return ToolAccepted(details={
+                    "operation": context.operation,
+                    "max_concurrency": self._config.max_concurrency,
+                    "duplicate_invocation": True,
+                })
+            self._started_keys[dedup_key] = None
+            while len(self._started_keys) > _STARTED_KEY_KEEP:
+                self._started_keys.popitem(last=False)
+            execution = _Execution(endpoint_id=context.endpoint_id,
+                                   operation=context.operation, key=key,
+                                   arguments=arguments)
             self._executions[key.invocation_id] = execution
 
         # 关键：官方 handler 只有在收到 **terminal event** 时才把 phase 推到终态。

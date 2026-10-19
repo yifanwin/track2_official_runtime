@@ -546,7 +546,9 @@ class RuntimeNode:
         return sink
 
     def _log(self, message: str) -> None:
-        if os.environ.get("TRACK2_LOG"):
+        # ⚠️ 判定必须**认 `"0"` 与空串**为「关」—— 否则 `TRACK2_LOG=0` 也被当成真
+        #    （`os.environ.get` 返回非空字符串 `"0"` 为真），从环境关不掉。
+        if os.environ.get("TRACK2_LOG", "").strip() not in ("", "0"):
             print(f"[track2-runtime] {message}", file=sys.stderr, flush=True)
 
     def _log_always(self, message: str) -> None:

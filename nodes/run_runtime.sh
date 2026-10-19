@@ -56,8 +56,10 @@ export TRACK2_CONTROL_MARKER="$(pwd)/.judge_control.json"
 #   ⚠️ 以前它只在手工设了环境变量时才开，而 `dora start --detach` 下节点由
 #   长命 daemon spawn，**环境里根本没有这个变量** → 实测一行都没有，
 #   所以「丢在哪一跳」一直定不了。这里**无条件打开**（低频、不刷屏）。
-#   要临时关掉：`TRACK2_LOG= ` 显式置空即可（下面用 `:=` 所以不会覆盖显式值）。
-: "${TRACK2_LOG:=1}"
+#
+#   要临时关掉：`TRACK2_LOG=0`（或置空）—— `_log()` 认 `"0"` 与空串为「关」。
+#   下面只在**未设**时才置 `1`，所以显式給的值（含 `0` / 空）不会被覆盖。
+if [ -z "${TRACK2_LOG+x}" ]; then TRACK2_LOG=1; fi
 export TRACK2_LOG
 
 exec "${TRACK2_PYTHON}" -u -m track2_maniskill_runtime "$@"

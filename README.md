@@ -61,7 +61,7 @@ player ──HTTP──▶ gateway          （把选手沙箱里的 Tool 调用
 | Tool ID | 语义 | 用途 |
 |---|---|---|
 | `track2.env.observe` | query | 读观测（本体状态 + task_inputs + 相机帧） |
-| `track2.robot.joint_control` | action | 一步关节目标（6 维）+ 夹爪开度 |
+| `track2.robot.joint_trajectory` | action | 一段关节轨迹（`targets`，8–25 步）—— **唯一的关节移动途径** |
 | `track2.robot.gripper_control` | action | 只动夹爪 |
 
 ### Action 治理（Q9 / Q12 / Q13 / Q14）
@@ -204,6 +204,10 @@ export TRACK2_SEED=0
 | **选手包注入 + 沙箱起停（第 4 步）** | ✅ 两条档都跑通（stdlib / official+CUDA） |
 
 ### 端到端实测（`work/scripts/e2e_step3.sh --action`）
+
+> ⚠️ **下面是 2026-10-16（第 3 步）的原始记录，当时 Tool 面还是单步 `joint_control`。**
+> **2026-10-18 起该 Tool 已删除**，唯一的关节控制途径是 `joint_trajectory`（`targets`，8–25 步）。
+> 记录本身保留原样（历史证据），**当前接口以 `SKILL.md` 与 `schema.py` 为准**。
 
 ```
 [3] gateway 已监听，revision=2          ← provider 的 endpoint.register 被接受
