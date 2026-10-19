@@ -45,4 +45,19 @@ export PAOS_SKILL_ROOT
 export TRACK2_PROFILE_DIR="$(pwd)"
 export TRACK2_CONTROL_MARKER="$(pwd)/.judge_control.json"
 
+# ★ 2026-10-19 **治本配套：默认打开 runtime 侧的诊断日志**。
+#
+#   `_log()` 打的是「同通道上被跳过的非执行消息」（`node.py` 的
+#   `忽略 <message_type>`）。它正是**定位丢包落在哪一跳**的唯一现场证据
+#   （见 `plan/Track2_丢包自锁修复方案.md` §5.1 的候选 (c)）：
+#     * 若日志里**看不到**某条 invoke 的任何痕迹 → 丢在 gateway 发出侧或 dora 通道；
+#     * 若看到「忽略 …」把它当注册应答跳过了 → 是我们自己的过滤 bug。
+#
+#   ⚠️ 以前它只在手工设了环境变量时才开，而 `dora start --detach` 下节点由
+#   长命 daemon spawn，**环境里根本没有这个变量** → 实测一行都没有，
+#   所以「丢在哪一跳」一直定不了。这里**无条件打开**（低频、不刷屏）。
+#   要临时关掉：`TRACK2_LOG= ` 显式置空即可（下面用 `:=` 所以不会覆盖显式值）。
+: "${TRACK2_LOG:=1}"
+export TRACK2_LOG
+
 exec "${TRACK2_PYTHON}" -u -m track2_maniskill_runtime "$@"

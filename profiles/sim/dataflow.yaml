@@ -34,13 +34,37 @@ nodes:
   #   2. daemon 会把解释器路径解析成 readlink 后的真路径，uv 建的 venv 会因此
   #      丢掉 site-packages（报 `No module named 'pyarrow'`）。
   # 包装脚本里自己读 `TRACK2_PYTHON`（由 skill.yaml 的 profile.environment 注入）。
+  #
+  # ★ 2026-10-19 **治本：给入站通道显式加深队列**（`queue_size: 32`）。
+  #
+  #   官方样例 `paos-resource-manager/examples/kai0-libero/.../dataflow.yaml`
+  #   对这三个入站口就是这么写的，注释原文是「**突发丢包缺陷的实测参数**
+  #   （显式加深，禁止回落默认）」—— 与我们观测到的症状同源。
+  #
+  #   我们原来写的是**短形式**（`env_from_gw: gateway/env_out`），那样**没有**
+  #   `queue_size`、走 dora 默认队列深度；突发时 gateway 侧发得快、runtime
+  #   侧消费慢（一次物理步 ~64.5 ms），中间就会**丢消息**。丢的那条 invoke
+  #   到了 runtime 侧从来没被见过 → 客户端轮询 status 拿到「unknown
+  #   invocation」→ 触发 A2 换 id（见 `node.py:_on_unknown_invocation`）
+  #   → 连带产生换 id 瞬间的 ROUTE_MISMATCH 竞态（②-A2b 收口）。
+  #
+  #   ⚠️ 带 `queue_size` 必须用**长形式**（官方样例的写法），短形式加不了。
+  #   行为差异：队列变深 ⇒ 突发时**延迟升高而不是丢消息**。我们的动作是
+  #   串行的，稳态不该积压，所以这个取舍是划算的。
+  #
+  #   ⚠️ `tick` 与 `image_to_gw`（出站）**保持原样** —— tick 是心跳，
+  #   空消息；image 是**出站**方向，不受入站队列影响。
   - id: runtime
     path: ${PAOS_SKILL_ROOT}/nodes/run_runtime.sh
     args: --config runtime.yaml
     inputs:
       tick: dora/timer/millis/1000
-      env_from_gw: gateway/env_out
-      robot_from_gw: gateway/robot_out
+      env_from_gw:
+        source: gateway/env_out
+        queue_size: 32
+      robot_from_gw:
+        source: gateway/robot_out
+        queue_size: 32
     outputs:
       - env_to_gw
       - robot_to_gw

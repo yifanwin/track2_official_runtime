@@ -63,11 +63,17 @@ from forge_tool import (                               # noqa: E402
     make_registration_envelope,
 )
 from forge_tool.wire import make_unregister_envelope    # noqa: E402
+from forge_tool.wire.errors import ToolProtocolError    # noqa: E402
 
 from .config import RuntimeConfig, load_config          # noqa: E402
 from .endpoints import Track2SimulationEndpoints        # noqa: E402
 
 __all__ = ["main", "start_runtime"]
+
+#: ★ ②-A2b：保留多少个「刚被取代的 instance id」（有界 FIFO）。
+#: 轮换是低频事件（每 episode 一次 + A2 每 10 s 最多一次），所以 8 个
+#: 足够覆盖「换 id 前后仍在 dora 队列里的那批请求」，又不会无限增长。
+_SUPERSEDED_ID_KEEP = 8
 
 # 与 dataflow.yaml 里的通道名一一对应：
 #   from_gw = 收 gateway 下发的请求（gateway.yaml 的 provider.output_id）
@@ -132,6 +138,10 @@ class RuntimeNode:
         #   gateway 按新 instance 钉住的请求会被 provider 按旧 instance 拒掉。
         self._instance_epoch = 0
         self._instance_lock = threading.Lock()
+        #: ★ ②-A2b：**刚被取代的 instance id**（有界 FIFO）。
+        #: `_handle_input` 对「带这些 id 的迟到请求」对齐到当前 id 重投 ——
+        #: 换 id 那一刻 dora 队列里可能还排着 gateway 用旧 id 发来的请求。
+        self._superseded_instance_ids: list[str] = []
         #: A2 的节流闸（见 `_on_unknown_invocation`）。0 = 还没换过。
         self._last_unknown_rotate = 0.0
         self.node = Node()
@@ -242,8 +252,19 @@ class RuntimeNode:
 
         with self._instance_lock:
             self._instance_epoch += 1
+            old_id = self.config.endpoint_instance_id
             new_config = rotate_instance_id(self.config, self._instance_epoch)
             new_id = new_config.endpoint_instance_id
+            # ★ ②-A2b：记下**刚被取代的 id** —— `_handle_input` 靠它认出
+            #   「落后于换 id 的在飞请求」并对齐重投（否则那条会被
+            #   ROUTE_MISMATCH 静默吞掉 → episode 记 infrastructure_timeout）。
+            #
+            #   只保留**本进程自己**的最近若干个 id（有界，防止无限增长）：
+            #   `_instance_base()` 保证同一进程的 id 前缀一致，所以这份集合
+            #   天然只含自己的 id —— 别人的 id 混不进来。
+            if old_id and old_id != new_id:
+                self._superseded_instance_ids.append(old_id)
+                del self._superseded_instance_ids[:-_SUPERSEDED_ID_KEEP]
             self.config = new_config
             # endpoints 也要拿到新 config（它读 `_config` 的地方不含 id，
             # 但保持一致，避免将来有人从它那里读 id 踩坑）
@@ -432,7 +453,36 @@ class RuntimeNode:
             # 官方 binding 自带 Arrow 解码 + wire 校验 + 相关性检查。
             # 我们不重复实现路由与账务。
             binding = self._binding(handler, route["to_gw"])
-            responses = self._run_async(binding.dispatch_input(value))
+            try:
+                responses = self._run_async(binding.dispatch_input(value))
+            except ToolProtocolError as exc:
+                # ★ ②-A2b（2026-10-19）**秒级竞态的收口**：换 instance id 是
+                #   「假装死一次」来让 gateway 释放并发围栏，但**翻转那一刻**，
+                #   dora 输入队列里可能还排着 gateway 用**旧 id** 发来的请求。
+                #   官方 handler 的路由校验是**严格等号**，于是那条在飞请求被
+                #   `FORGE_PROTOCOL_ROUTE_MISMATCH` 拒掉 —— 而这里以前把它**静默
+                #   吞掉**，客户端就一直轮询到 5 s 超时 → 该 episode 记
+                #   `infrastructure_timeout` → **整个 case 不可发布**。
+                #   （实测发生率 0.8%：250 episode 里 2 次。）
+                #
+                #   修法：若请求带的是**本进程**一个**刚被取代**的 id，就把它的
+                #   id 对齐到当前值**重投一次**。
+                #
+                #   ✅ **为什么安全**（两点都已核实）：
+                #     1. gateway 只对响应做**相关性**校验（request_id /
+                #        invocation_id / attempt_id / endpoint_id / operation），
+                #        **不比对 instance id**（`_logical_provider_response`）；
+                #     2. 官方 handler 也**只在路由校验里**读请求的 instance id，
+                #        别处不读（`handler.py:353` 是全库唯一读点）。
+                #   所以「对齐后重投」不会伪造或掩盖任何真实的路由错误 ——
+                #   endpoint_id / operation 仍然逐字校验；只有 instance id
+                #   被限定在**本进程自己的历史 id 集合**内。
+                value2 = self._realign_superseded_instance(value)
+                if value2 is None:
+                    raise
+                self._log_always(
+                    "落后于换 id 的在飞请求 → 对齐到当前 instance id 重投")
+                responses = self._run_async(binding.dispatch_input(value2))
             for batch in responses:
                 self.node.send_output(route["to_gw"], batch)
         except Exception as exc:
@@ -440,6 +490,34 @@ class RuntimeNode:
             print(f"[track2-runtime] input {input_id} failed: "
                   f"{type(exc).__name__}: {str(exc)[:160]}",
                   file=sys.stderr, flush=True)
+
+    def _realign_superseded_instance(self, value):
+        """把一条**带旧 instance id** 的请求对齐到当前 id，返回新的 arrow。
+
+        只在「那个旧 id 是本进程刚用过的」时才动手 —— 别人的 id、或乱写的 id
+        一律返回 `None`，让调用方**如实抛出**原来的 `ROUTE_MISMATCH`
+        （不掩盖真实的路由错误）。
+
+        `endpoint_id` / `operation` / `invocation_id` 等**原样保留**，
+        只改 `endpoint_instance_id` 一个字段。
+        """
+        import dataclasses
+        from forge_msgs import ToolMessage
+        from forge_tool.dora import tool_message_to_envelope, tool_envelope_to_message
+
+        try:
+            envelope = tool_message_to_envelope(ToolMessage.from_arrow(value))
+        except Exception:                                       # noqa: BLE001
+            return None
+        stale = envelope.endpoint_instance_id
+        with self._instance_lock:
+            known = set(self._superseded_instance_ids)
+            current = self.config.endpoint_instance_id
+        if stale is None or stale == current or stale not in known:
+            return None
+        # 只改这一个字段（`ToolEnvelope` 是 frozen dataclass）
+        realigned = dataclasses.replace(envelope, endpoint_instance_id=current)
+        return tool_envelope_to_message(realigned).to_arrow()
 
     def _binding(self, handler, to_gw: str):
         """复用 binding —— 它是有状态的（持有 handler 与 event_sink）。

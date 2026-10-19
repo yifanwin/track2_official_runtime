@@ -241,8 +241,23 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         #   实测症状：连着下发 seed=0、seed=3 两个 episode，布局与 RGB 帧的
         #   sha256 **逐位相同** —— 看起来像「选手看到的是旧题」，而日志里
         #   一个错都没有。这正是「两条路径各写一遍构造」这类漂移的典型形态。
+        # ★ 2026-10-19：把 `_episode_seq` 也纳入签名 —— 语义是**每次 reset 都重建**。
+        #
+        #   上面那段注释说的「每次调用重建场景」本来就是本模块的契约，但原来的
+        #   签名只含 `(case_id, seed, camera, recovery, checkpoints)`：**同 seed
+        #   连续两次 reset 不会重建**，第二次会从第一次留下的物理状态继续。
+        #
+        #   这在旧口径（first/final 的「失败后不 reset 追加执行」）下是**故意的**；
+        #   但 2026-10-18 取消 first/final 之后，它变成了一个**坑**：
+        #   episode 级重测（`resident_runner.EPISODE_RETRIES`）要的是「重来一次」，
+        #   而同一个 seed 重跑时签名不变 ⇒ 场景不重建 ⇒ 变成「从半途继续」——
+        #   那就不是重测，是追加执行，会污染成绩。
+        #
+        #   `_episode_seq` 每次 `reset_episode` 都递增，所以放进签名就等价于
+        #   「每 episode 必重建」，与本文档的契约一致。
         signature = (case_id, int(seed), bool(self._config.camera_required),
-                     recovery, tuple(map(repr, checkpoints)))
+                     recovery, tuple(map(repr, checkpoints)),
+                     int(getattr(self, "_episode_seq", 0)))
         # 换 case / 换 seed / 换 mode 都必须重建（bundle、布局与事件策略都不同）。
         if previous != case_id or self._session is None \
                 or self._session_signature != signature:
