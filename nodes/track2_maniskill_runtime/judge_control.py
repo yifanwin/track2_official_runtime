@@ -105,6 +105,14 @@ class _Handler(BaseHTTPRequestHandler):
         server: JudgeControlServer = self.server.judge_control     # type: ignore[attr-defined]
         if not server.authorized(self.headers.get("X-Track2-Judge-Token")):
             return self._reply(403, {"error": "unauthorized"})
+        # ★ 2026-10-19：`/episode/rotate_fence` —— 无 body，立即换 instance id
+        #   释放被占死的并发围栏（见 `JudgeControlServer.rotate_fence`）。
+        if self.path == "/episode/rotate_fence":
+            try:
+                return self._reply(200, server.rotate_fence())
+            except Exception as exc:                            # noqa: BLE001
+                return self._reply(500, {"error": type(exc).__name__,
+                                         "message": str(exc)[:300]})
         if self.path != "/episode/reset":
             return self._reply(404, {"error": "unknown path"})
         length = int(self.headers.get("Content-Length") or 0)
@@ -160,6 +168,34 @@ class JudgeControlServer:
     def timings(self) -> dict:
         """Q14：本 flow 至今所有 Action 的执行耗时分布。"""
         return self._endpoints.judge_timings()
+
+    def rotate_fence(self) -> dict:
+        """★ 2026-10-19：**立即换 provider 的 instance id**，释放被占死的并发围栏。
+
+        为什么需要它：gateway 的 `max_concurrency = 1` 围栏在 action deadline
+        到期而 provider 未发终态时会被**有意保持**（`action_invocations.py:389`
+        "Keep the concurrency fence"），此后每个 Action 都被拒
+        `operation concurrency 1 is exhausted`。唯一能释放它的路径是
+        `mark_instance_ambiguous` —— 而它只在「注册的 instance id 与 invocation
+        钉住的不一致」时触发（`tool_directory.py:227-233`）。
+
+        A1 只在 **episode 边界**换 id ⇒ 一个 episode 内占死无法自愈。本端点把
+        换 id 变成**可被 player 即时调用**的动作，用于 episode 中途自救。
+
+        与 A1 共用同一个钩子（`on_episode_started` → `node._rotate_instance_id`），
+        所以「三处同时换」（config / handler / register 请求体）的逻辑不必重写。
+
+        ⚠️ **幂等且安全**：换 id 只让 gateway 眼里的 provider「死一次」，
+        provider 自身与物理场景**不受影响**。
+        """
+        hook = getattr(self._endpoints, "on_episode_started", None)
+        if hook is None:
+            return {"rotated": False, "reason": "no hook"}
+        try:
+            hook()
+        except Exception as exc:                                # noqa: BLE001
+            return {"rotated": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"rotated": True}
 
     # ── 生命周期
 

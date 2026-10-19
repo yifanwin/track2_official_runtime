@@ -70,8 +70,8 @@ from track2_judge.sandbox.rpc import (                    # noqa: E402
     BudgetTimeout, SecurityNotReady, SkillError, SkillTimeout,
 )
 from track2_judge.toolapi.client import (                # noqa: E402
-    ActionStoppedUnknown, ActionTimeout, HttpTransport, SandboxBridge,
-    ToolCallError, ToolClient,
+    ActionRejected, ActionStoppedUnknown, ActionTimeout, HttpTransport,
+    SandboxBridge, ToolCallError, ToolClient,
 )
 
 #: 选手侧「链路故障」的显式归类（2026-10-18）。
@@ -79,6 +79,14 @@ from track2_judge.toolapi.client import (                # noqa: E402
 # 它们是 `ToolCallError` 的子类，**不继承** `BudgetTimeout` —— 归到
 # `infrastructure_timeout`。这样 `ResultGate` 能一眼把「正常预算耗尽」与
 # 「gateway/链路坏了」分开：前者放行（按当前物理状态判分），后者阻断。
+#
+# ⚠️ **★ 2026-10-19：`ActionRejected` 必须显式排除。**
+#
+# 它**继承 `ToolCallError`**，所以若只靠这个元组兜，选手的错（动作超限幅、
+# 超限位、chunk 太短、工具没声明）会被一起归进 `infrastructure_timeout`
+# → 整 case BLOCKED ⇒ **把「你写错了」误报成「基础设施坏了」**，既丢分
+# 又误导选手。所以下面 `except` 的**顺序**必须是先 `ActionRejected`
+# （归可评分的 `skill_error`）、再 `INFRASTRUCTURE_ERRORS`。
 INFRASTRUCTURE_ERRORS = (ActionStoppedUnknown, ActionTimeout, ToolCallError)
 
 __all__ = ["PlayerConfig", "PlayerConfigError", "PlayerNode", "main", "start_player"]
@@ -235,9 +243,61 @@ class ProfileGatedBridge(SandboxBridge):
     两层的关系是「全集」与「子集」，都在调用路径上，缺一不可。
     """
 
-    def __init__(self, client: ToolClient, allowed: tuple[str, ...]) -> None:
+    def __init__(self, client: ToolClient, allowed: tuple[str, ...],
+                 *, control_url: str = "", now=None) -> None:
         super().__init__(client)
         self.allowed = frozenset(allowed)
+        #: ★ 2026-10-19：judge 私有控制口。**围栏自愈**要用它（见 `__call__`）。
+        self.control_url = control_url or ""
+        self._clock = now or time.monotonic
+        #: 上次围栏自愈的时刻（节流用；与 A2 的 10 s 同源理由）。
+        self._last_fence_rotate = 0.0
+
+    #: 围栏自愈的节流窗口（秒）。**大于单次动作超时（5 s）** ⇒ 一次动作最多
+    #: 触发一次自愈；而一个 episode 通常几十秒 ⇒ 仍能救回后续动作。
+    FENCE_ROTATE_COOLDOWN_S = 10.0
+
+    #: 「围栏被占死」的**错误文本特征**（gateway 侧原文，见
+    #: `Forgelab/.../action_invocations.py:126`）。
+    #:
+    #: ⚠️ 用**完整短语**，不用裸词 `concurrency` / `is exhausted` ——
+    #: 后者会误匹配 `Action invocation capacity 64 is exhausted`（**总容量**
+    #: 上限，另一种问题，换 id 救不了）。
+    _FENCE_MARKERS = (
+        "concurrency 1 is exhausted",            # per-operation 围栏占死
+        "pinned provider lease expired",         # deadline 到期后 provider 被判死
+        "pinned provider instance became unavailable",
+        "provider instance restarted",
+    )
+
+    def _is_fence_error(self, exc: BaseException) -> bool:
+        text = str(exc)
+        return any(m in text for m in self._FENCE_MARKERS)
+
+    def _rotate_fence(self) -> bool:
+        """调 control 口的 `/episode/rotate_fence`，释放被占死的并发围栏。
+
+        **只对「围栏类」错误调用** —— 它是止血手段，不是万能重试。
+        成功返回 True；任何失败都返回 False（**不抛**：自愈失败不该让
+        选手的 episode 直接崩掉，后续仍会照常拿到原来的错误分类）。
+        """
+        if not self.control_url:
+            return False
+        now = self._clock()
+        if now - self._last_fence_rotate < self.FENCE_ROTATE_COOLDOWN_S:
+            return False
+        self._last_fence_rotate = now
+        import json as _json
+        import urllib.request as _url
+        try:
+            req = _url.Request(self.control_url.rstrip("/") + "/episode/rotate_fence",
+                               data=b"{}", method="POST",
+                               headers={"Content-Type": "application/json"})
+            with _url.urlopen(req, timeout=10) as resp:       # noqa: S310 (loopback)
+                payload = _json.loads(resp.read().decode("utf8") or "{}")
+            return bool(payload.get("rotated"))
+        except Exception:                                       # noqa: BLE001
+            return False
 
     def __call__(self, method: str, payload: dict | None = None):
         tool_id = METHOD_TO_TOOL.get(method, method)
@@ -245,7 +305,21 @@ class ProfileGatedBridge(SandboxBridge):
             raise ToolCallError(
                 f"tool {tool_id!r} is not declared in this skill's tool_profile "
                 f"({', '.join(sorted(self.allowed))})")
-        return super().__call__(method, payload)
+        try:
+            return super().__call__(method, payload)
+        except Exception as exc:                                # noqa: BLE001
+            # ★ 2026-10-19 **围栏自愈**：并发围栏被占死后，**所有**后续动作
+            #   都会被拒 `operation concurrency 1 is exhausted`，直到换
+            #   instance id 触发 gateway 的 `mark_instance_ambiguous`。
+            #   A1 只在 episode 边界换 id ⇒ 一个 episode 内占死就全废 ——
+            #   这里补上「就地自救」，然后**重试这一次调用**。
+            #
+            #   ⚠️ 只对围栏类错误做；别的错误（schema / slew / 链路）原样抛。
+            if not self._is_fence_error(exc) or not self._rotate_fence():
+                raise
+            print(f"[track2-player] 围栏自愈：换 instance id 后重试 {tool_id}",
+                  file=sys.stderr, flush=True)
+            return super().__call__(method, payload)
 
 
 class PlayerNode:
@@ -385,7 +459,8 @@ class PlayerNode:
             action_timeout_s=self.config.action_timeout_s,
             max_action_steps=self.config.tool_call_budget,
         )
-        bridge = ProfileGatedBridge(client, manifest.tool_profile)
+        bridge = ProfileGatedBridge(client, manifest.tool_profile,
+                                    control_url=self.config.control_url)
 
         status = "ok"
         skill_result: dict[str, Any] = {}
@@ -442,6 +517,15 @@ class PlayerNode:
                 #   该 episode 记 `skill_error`（可评分），照常读物理终态判分。
                 #   以前它落进 `RuntimeError` → 默认分支 → `infrastructure_timeout`
                 #   → 整 case BLOCKED（迁移期一个老包会让 50 个 case 全挂）。
+                status = "skill_error"
+            except ActionRejected:
+                # ★ 2026-10-19：**选手下发的动作参数不合法** —— 也是「选手的错」，
+                #   与 `SkillError` 同样归**可评分**的 `skill_error`。
+                #
+                #   ⚠️ **必须排在 `INFRASTRUCTURE_ERRORS` 之前** ——
+                #   `ActionRejected` 是 `ToolCallError` 的子类，顺序反了就会被
+                #   后一个 `except` 抢走，记成 `infrastructure_timeout` 并 BLOCKED
+                #   （这正是修前的行为：把「超限幅」误报成「基础设施坏了」）。
                 status = "skill_error"
             except INFRASTRUCTURE_ERRORS:
                 # ★ 链路故障（丢包 / 503 / 动作超时且物理状态不明）——

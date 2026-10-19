@@ -197,19 +197,25 @@ class RuntimeNode:
 
         # ② ★ 2026-10-19 并行化（八卡）：把本 worker 的 GPU 定下来。
         #
-        #   **必须在任何 CUDA 初始化之前** —— `torch`/SAPIEN 一旦初始过，
-        #   可见设备列表就固定了，再改 `CUDA_VISIBLE_DEVICES` 无效
-        #   （实测：改在预热之后 ⇒ 两路仍全落卡 0）。
+        #   **两个动作必须配对**（实测踩过）：
+        #     a) `CUDA_VISIBLE_DEVICES=<物理卡号>` —— 限制本进程只看见那一张卡；
+        #     b) `render_device='sapien_cuda:0'` —— 渲染取**可见列表的第 0 个**
+        #        （即 a 指定的那张）。
         #
-        #   取值**走配置**（`runtime.yaml` 的 `render_gpu`），不走环境变量：
-        #   `--detach` 下节点由长命 daemon spawn，daemon 环境里没有 `TRACK2*`
-        #   （实测），走环境变量会**静默地**不生效。裁判侧按 worker 渲染本项。
+        #   ⚠️ **不要写 `sapien_cuda:<物理卡号>`**：`sapien.Device("cuda:N")`
+        #   里的 N 是 **CUDA 运行时编号**（受 `CUDA_VISIBLE_DEVICES` 影响）。
+        #   设了 `CUDA_VISIBLE_DEVICES=6` 后只有 1 张卡可见（编号 0），
+        #   再要 `cuda:6` 就越界 ⇒ `failed to find device "cuda:6"`（实测）。
         #
-        #   为什么必须设：`env_factory` 写死 `render_backend='sapien_cuda:0'`，
-        #   而 `cuda:0` 是「`CUDA_VISIBLE_DEVICES` 里的第 0 个」；为空时落回
-        #   **物理卡 0**。8 路全挤卡 0 ⇒ 物理步变慢 ⇒ action 撞 5 s 超时
-        #   ⇒ 围栏槽位不释放 ⇒ `concurrency 1 exhausted`（同因两症）。
+        #   为什么必须两个都做：`prototype_env` 在 import 时会把
+        #   `CUDA_VISIBLE_DEVICES` 清空（CPU 档约定）—— `select_case.py:148`
+        #   早就踩过并留了 workaround，只是**评测链路没走它**。清空后
+        #   SAPIEN 看到全部 8 卡，渲染会落到物理卡 0（与别人抢）。
+        #
+        #   取值**走配置**（`runtime.yaml` 的 `render_gpu`）：`--detach` 下节点
+        #   由长命 daemon spawn，daemon 环境里没有 `TRACK2*`。裁判侧按 worker 渲染。
         _gpu = str(getattr(self.config, "render_gpu", "") or "").strip()
+        _render_device = 'sapien_cuda:0' if _gpu else None
         if _gpu:
             os.environ["CUDA_VISIBLE_DEVICES"] = _gpu
 
@@ -251,6 +257,8 @@ class RuntimeNode:
             live=True,                      # 模式 B：每步重拍，不缓存首帧
             max_steps=self.config.max_steps,
             max_sim_time_s=self.config.max_sim_time_s,
+            # ★ 并行：显式把渲染钉在本 worker 的卡上（不靠环境变量）。
+            render_device=_render_device,
             case_id=self.config.case_id)
         adapter = session.adapter
         adapter.reset(seed=self.config.seed, public_task_inputs=public)

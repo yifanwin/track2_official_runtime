@@ -739,9 +739,26 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         `INFRASTRUCTURE_ERRORS` → `infrastructure_timeout` → **Gate BLOCKED**。
         但「预算正常用满」是**可评分**的 `budget_timeout`，不是链路故障。
         所以给它一个**专用错误码**，客户端据此单独映射。
+
+        ★ 2026-10-19 **同一模式再修一类：选手参数非法**。
+
+        `ValueError: target slew exceeded` / `outside Piper limits` /
+        `numeric values required` / `dimension or finite check failed` —— 这些是
+        **选手下发的动作不合法**（`dispatch.py` 的 `assert_within_limits` /
+        `assert_within_slew` 抛的），**不是链路故障**。以前它们和链路故障一起走
+        `TRACK2_ACTION_FAILED` → `ToolCallError` → `infrastructure_timeout` →
+        整 case BLOCKED ⇒ **把「选手写错了」误报成「基础设施坏了」**，
+        既丢分又误导选手。
+
+        现在复用**既有的** `TRACK2_ACTION_REJECTED` 码（同一模块的 `_rejected()`
+        早就用它表示「入参被拒」，只是那只覆盖 schema 层）—— 客户端据此归
+        **可评分**的 `skill_error`（照常按物理终态判分）。
         """
         if isinstance(exc, RuntimeError) and "control budget exhausted" in str(exc):
             return "TRACK2_CONTROL_BUDGET_EXHAUSTED"
+        # ★ 选手参数非法（校验类 ValueError）—— 可评分，不是链路故障。
+        if isinstance(exc, ValueError) and _is_caller_argument_error(exc):
+            return "TRACK2_ACTION_REJECTED"
         return "TRACK2_ACTION_FAILED"
 
     def _run_chunk_blocking(self, record: "_Execution", adapter) -> dict:
@@ -991,3 +1008,27 @@ def _rejected(message: str) -> Exception:
     from forge_tool import ToolEndpointError
     return ToolEndpointError(
         ToolError(code="TRACK2_ACTION_REJECTED", message=message, retryable=False))
+
+
+#: 选手参数非法的**已知文案**（来自 `track2_judge/toolapi/dispatch.py` 的校验）。
+#: 只认这些 —— **不要**用「所有 ValueError」兜，否则会把内部 bug 也误判成
+#: 「选手的错」而放过（那会让真故障变成可评分，方向反了）。
+_CALLER_ARG_ERRORS = (
+    "target slew exceeded",
+    "outside Piper limits",
+    "numeric values required",
+    "dimension or finite check failed",
+)
+
+
+def _is_caller_argument_error(exc: BaseException) -> bool:
+    """这个异常是不是「选手下发的动作参数不合法」（可评分，非链路故障）？
+
+    与 `_rejected()` 是同一类语义（入参被拒）：`_rejected` 覆盖 **schema 层**
+    （handled 得更早），这里覆盖 **物理校验层**（`dispatch.py` 的限位/限幅）。
+
+    ⚠️ 白名单而非黑名单：宁可漏判（退回 `TRACK2_ACTION_FAILED` → 阻断，保守），
+    也不要把未知异常当成「选手的错」而放行。
+    """
+    text = str(exc)
+    return any(marker in text for marker in _CALLER_ARG_ERRORS)
