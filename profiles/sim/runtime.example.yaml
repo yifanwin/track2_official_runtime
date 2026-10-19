@@ -17,8 +17,8 @@ seed: 0
 casebank: judge_private/casebank      # 相对 TRACK2_PHYSICS_ROOT
 
 # episode 预算 —— 与评测器 runner 的语义一致
-max_steps: 2400
-max_sim_time_s: 120.0
+max_steps: 400
+max_sim_time_s: 20.0
 
 # Action 治理（Q9 / Q12 / Q14）
 max_concurrency: 1              # Q9：关节控制天然串行

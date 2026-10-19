@@ -37,11 +37,8 @@ JSON-lines 桥（`SandboxBridge`，在宿主进程里）。所以宿主上再开
 ## 协议
 
 ```http
-POST /episode/reset      {"case_id": "...", "seed": 0, "mode": "final"}
-  → {"ok": true, "case_id": ..., "seed": ..., "mode": ..., "seq": 1, "attempt": 1}
-
-POST /episode/next_attempt          （无 body）
-  → {"ok": true, ..., "seq": 1, "attempt": 2}     # 不 reset、不动 seq
+POST /episode/reset      {"case_id": "...", "seed": 0}
+  → {"ok": true, "case_id": ..., "seed": ..., "seq": 1, "attempt": 1}
 
 GET  /episode/snapshot
   → {"episode": {...}, "layout": {...}, "physical": {...}, ...}
@@ -50,8 +47,8 @@ GET  /health
   → {"ok": true, "episode": {...}}
 ```
 
-`next_attempt` 是边界决策 §1.2 的落点：`final` 下第 2/3 次 `run()` 必须在
-**同一物理状态**上继续（不 reset），所以它只推一个计数、不碰场景。
+★ 2026-10-18：`POST /episode/next_attempt` **已删除** —— 取消 first/final 后
+不再有「失败后追加执行」。每次 `reset` 就是一段连续的、可自由闭环的执行。
 
 `snapshot` 的 `physical` 就是 **judge-only 私有真值** ——
 **绝不进 gateway、绝不进选手 context**。
@@ -108,13 +105,6 @@ class _Handler(BaseHTTPRequestHandler):
         server: JudgeControlServer = self.server.judge_control     # type: ignore[attr-defined]
         if not server.authorized(self.headers.get("X-Track2-Judge-Token")):
             return self._reply(403, {"error": "unauthorized"})
-        # `next_attempt` 没有 body —— 它只推 attempt 计数，不碰场景。
-        if self.path == "/episode/next_attempt":
-            try:
-                return self._reply(200, server.next_attempt())
-            except Exception as exc:                            # noqa: BLE001
-                return self._reply(500, {"error": type(exc).__name__,
-                                         "message": str(exc)[:300]})
         if self.path != "/episode/reset":
             return self._reply(404, {"error": "unknown path"})
         length = int(self.headers.get("Content-Length") or 0)
@@ -126,8 +116,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._reply(400, {"error": "bad json", "message": str(exc)[:200]})
         try:
             result = server.reset(case_id=payload["case_id"],
-                                  seed=payload["seed"],
-                                  mode=payload.get("mode", "final"))
+                                  seed=payload["seed"])
         except KeyError as exc:
             return self._reply(400, {"error": f"missing field: {exc}"})
         except Exception as exc:                                # noqa: BLE001
@@ -162,15 +151,8 @@ class JudgeControlServer:
     def episode(self) -> dict:
         return dict(getattr(self._endpoints, "_episode", {}) or {})
 
-    def reset(self, *, case_id: str, seed: int, mode: str) -> dict:
-        return self._endpoints.reset_episode(case_id, int(seed), mode)
-
-    def next_attempt(self) -> dict:
-        """同一 episode 内追加一次 Skill 执行（`final` 的第 2/3 次）。
-
-        **不 reset、不动 `seq`** —— 第 2 次 `run()` 必须看到前一次留下的真实终态。
-        """
-        return self._endpoints.next_attempt()
+    def reset(self, *, case_id: str, seed: int) -> dict:
+        return self._endpoints.reset_episode(case_id, int(seed))
 
     def snapshot(self) -> dict:
         return self._endpoints.judge_snapshot()

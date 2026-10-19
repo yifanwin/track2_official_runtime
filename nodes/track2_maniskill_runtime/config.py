@@ -31,8 +31,8 @@ class RuntimeConfig:
     casebank: Path = field(default_factory=lambda: Path(""))
 
     # ── episode 预算（与 runner 的语义一致）
-    max_steps: int = 2400
-    max_sim_time_s: float = 120.0
+    max_steps: int = 400
+    max_sim_time_s: float = 20.0
 
     # ── Action 治理（Q9 / Q12 / Q14）
     # Q9：关节控制天然串行

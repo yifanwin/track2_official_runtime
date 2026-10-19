@@ -21,7 +21,7 @@
 gateway**（实测：`work/scripts/check_sandbox_official.py`）。走既有的 JSON-lines 桥：
 
 ```text
-沙箱内 tools.joint_control(q, g)
+沙箱内 tools.joint_trajectory(targets)
   → 协议 stdout/stdin（package_host.py:ToolClient）
   → 本节点（SandboxBridge → ToolClient(HttpTransport)）
   → POST http://127.0.0.1:<port>/tools/...:invoke
@@ -67,7 +67,7 @@ from track2_judge.runner.skill_manifest import (         # noqa: E402
 )
 from track2_judge.sandbox.package import PackageExecutor  # noqa: E402
 from track2_judge.sandbox.rpc import (                    # noqa: E402
-    BudgetTimeout, SecurityNotReady, SkillTimeout,
+    BudgetTimeout, SecurityNotReady, SkillError, SkillTimeout,
 )
 from track2_judge.toolapi.client import (                # noqa: E402
     ActionStoppedUnknown, ActionTimeout, HttpTransport, SandboxBridge,
@@ -84,11 +84,13 @@ INFRASTRUCTURE_ERRORS = (ActionStoppedUnknown, ActionTimeout, ToolCallError)
 __all__ = ["PlayerConfig", "PlayerConfigError", "PlayerNode", "main", "start_player"]
 
 # 选手侧方法名 → Tool ID。与 `toolapi/client.py` 的别名表同一套。
+#
+# ⚠️ 2026-10-18 强制 Action Chunk：`joint_control` / `step` /
+#    `piper_joint_control` **已真删** —— 选手调旧名会在这里查不到键，
+#    如实报错（**不是**静默映射到别的 Tool）。老包不给兼容期。
 METHOD_TO_TOOL = {
     "observe": "track2.env.observe",
-    "joint_control": "track2.robot.joint_control",
-    "step": "track2.robot.joint_control",
-    "piper_joint_control": "track2.robot.joint_control",
+    "joint_trajectory": "track2.robot.joint_trajectory",
     "gripper_control": "track2.robot.gripper_control",
     "piper_gripper_control": "track2.robot.gripper_control",
 }
@@ -110,10 +112,9 @@ class PlayerConfig:
         default_player = self.bundle_root / "profiles" / self.profile / "player"
         self.player_dir = Path(
             env.get("TRACK2_PLAYER_DIR") or default_player).expanduser()
-        self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 600)
-        self.tool_call_budget = int(env.get("TRACK2_TOOL_CALL_BUDGET") or 2400)
+        self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 120)
+        self.tool_call_budget = int(env.get("TRACK2_TOOL_CALL_BUDGET") or 200)
         self.action_timeout_s = float(env.get("TRACK2_ACTION_TIMEOUT_S") or 5)
-        self.mode = (env.get("TRACK2_MODE") or "final").strip() or "final"
         # 等 gateway + provider 注册就绪的上限（建场景要几十秒）
         self.ready_timeout_s = float(env.get("TRACK2_PLAYER_READY_TIMEOUT_S") or 300)
         # Judge 私有控制口的地址（B1/B4）。**不给 = 空串 = 关闭常驻**，
@@ -362,7 +363,8 @@ class PlayerNode:
         try:
             executor.initialize({
                 "skill_api_version": manifest.api_version,
-                "mode": self.config.mode,
+                # ★ 2026-10-18：`mode` **已从 context 删除**（取消 first/final）。
+                #   老包读 `context["mode"]` 会 `KeyError` —— 不给兼容期。
                 "environment": self.config.profile,
                 "tool_call_budget": self.config.tool_call_budget,
                 # 沙箱档是**运行事实**，选手需要知道 GPU 能不能用。
@@ -399,6 +401,12 @@ class PlayerNode:
                 #   语义：到时间 → 停止执行 → 冻结当前物理状态 → 照常按 P1/P2/C1 判分。
                 #   `ResultGate` 放行这个终态。
                 status = "budget_timeout"
+            except SkillError:
+                # ★ F2：**选手包自己抛的异常** —— 不算链路故障。
+                #   该 episode 记 `skill_error`（可评分），照常读物理终态判分。
+                #   以前它落进 `RuntimeError` → 默认分支 → `infrastructure_timeout`
+                #   → 整 case BLOCKED（迁移期一个老包会让 50 个 case 全挂）。
+                status = "skill_error"
             except INFRASTRUCTURE_ERRORS:
                 # ★ 链路故障（丢包 / 503 / 动作超时且物理状态不明）——
                 #   **不能伪装成正常超时**，`ResultGate` 要按执行异常阻断。
@@ -553,10 +561,8 @@ class PlayerNode:
             self._current_seq = seq
             self._current_attempt = attempt
             episode = snapshot.get("episode") or {}
-            print(f"[track2-player] 新 episode seq={seq} attempt={attempt} "
-                  f"case={episode.get('case_id')} seed={episode.get('seed')} "
-                  f"mode={episode.get('mode')}"
-                  + ("" if fresh else "（同一 episode 的追加执行，**不 reset**）"),
+            print(f"[track2-player] 新 episode seq={seq} "
+                  f"case={episode.get('case_id')} seed={episode.get('seed')}",
                   file=sys.stderr, flush=True)
             try:
                 # ⚠️ 每一轮都**新建** `PackageExecutor`（B3-a）：选手进程是新的，

@@ -133,12 +133,12 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         # B1/B2：常驻 session 与当前 episode 的记账（**Judge-only**）
         self._session = None
         self._session_case: str | None = None
-        #: 建 session 时用的参数签名。换 case / 换 mode / 换相机都对应**不同**
+        #: 建 session 时用的参数签名。换 case / 换 seed / 换相机都对应**不同**
         #: 的 event policy 与白名单，必须重建 —— 只比 `case_id` 会串味。
         self._session_signature: tuple | None = None
         self._episode: dict = {}
         self._episode_seq: int = 0
-        #: 同一 episode 内的第几次 Skill 执行（`final` 最多 3）。`next_attempt()` 推它。
+        #: 恒为 1（取消 first/final 后不再有追加执行）。
         self._attempt_seq: int = 0
         #: `reset` 之后**立刻**采的初态（judge-only，B2'）。
         #: 判分要「选手动手之前」的布局，末态替代不了 —— 详见 `_reset_blocking`。
@@ -168,7 +168,7 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
     def _open_blocking(self) -> None:
         self._adapter = self._adapter_factory()
 
-    def reset_episode(self, case_id: str, seed: int, mode: str = "final") -> dict:
+    def reset_episode(self, case_id: str, seed: int) -> dict:
         """**Judge-only**：在一个**常驻 flow** 里换 episode（B1）。
 
         这是「循环归 Judge，flow 常驻」那条边界的落地 —— Judge 通过
@@ -182,9 +182,9 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
           但 `initial_layout` 变了 —— 所以选手的第一帧必须是新的）
         * **不 reset 物理状态以外的东西**：选手进程由 player 节点负责（B3/B4）
 
-        ⚠️ `first` / `final` **不是**选手可见语义；它只改**Judge 侧的**证据收集
-        深度（`final` 开 recovery + P5 checkpoints，与 `candidate_runner` 一致），
-        **不改选手那一轮 run() 里能做什么**。
+        ★ 2026-10-18 取消 first/final：**不再有 `mode`**。每次调用就是一个
+        episode；「失败后追加执行」的机制（`next_attempt`）已删除。
+        `recovery` 恒 `False`。
         """
         if self._closed:
             raise ToolError(code="TRACK2_RUNTIME_CLOSED",
@@ -197,42 +197,9 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
             raise ToolError(code="TRACK2_BAD_CASE",
                             message="case_id must be a non-empty string",
                             retryable=False)
-        return self._run_blocking(self._reset_blocking, case_id, seed, mode)
+        return self._run_blocking(self._reset_blocking, case_id, seed)
 
-    def next_attempt(self) -> dict:
-        """**Judge-only**：在同一物理状态上追加一次 Skill 执行（B1'）。
-
-        边界决策 §1.2：
-
-        ```text
-        final:
-            从同一个 S0 reset
-            调 run() 最多 3 次
-              第 1 次失败：**不 reset**，再调 run()
-              第 2 次失败：**不 reset**，再调 run()
-        ```
-
-        「不 reset」是关键 —— 第二、三次 `run()` 必须看到**前一次留下的真实终态**
-        （物体被挪过 / 抓过 / 掉过）。所以这里**只**推进 attempt 计数、
-        **不碰场景**。`seq` 也不动：`seq` 表示「新 episode」，attempt 表示
-        「同一 episode 里的第几次执行」。
-
-        ⚠️ 为什么不让 player 自己在 `run()` 里循环：`final` 的语义是「**裁判**
-        看到失败之后**决定**再给一次机会」——中间那次 verify 在裁判侧。
-        让 player 自己循环就等于把判定塞进了选手进程。
-        """
-        if self._closed:
-            raise ToolError(code="TRACK2_RUNTIME_CLOSED",
-                            message="runtime is closed", retryable=False)
-        if not self._episode:
-            raise ToolError(code="TRACK2_NO_EPISODE",
-                            message="no episode has been reset yet",
-                            retryable=False)
-        self._attempt_seq = int(getattr(self, "_attempt_seq", 0)) + 1
-        self._episode = {**self._episode, "attempt": self._attempt_seq}
-        return {"ok": True, **self._episode}
-
-    def _reset_blocking(self, case_id: str, seed: int, mode: str) -> dict:
+    def _reset_blocking(self, case_id: str, seed: int) -> dict:
         from track2_judge.observation.public_task_view import public_task_inputs
         from track2_judge.scenario.session import build_case_session
 
@@ -256,13 +223,12 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         oracle_on = bool(getattr(self._config, "oracle_planning", False))
         public_fields = tuple(public) + (('oracle_plan',) if oracle_on else ())
 
-        # `final` 要给 P5 事件证据（`candidate_runner` 里 recovery 与 checkpoints
-        # 就是这么来的）—— 没有它 judge_snapshot 的 `physics_health` / P5 是
-        # 「NOT CONFIGURED」，评分侧会缺证据。
+        # P5 checkpoints 仍要采（judge_snapshot 的 `physics_health` / P5 靠它，
+        # 否则是「NOT CONFIGURED」，评分侧缺证据）。`recovery` 恒 False。
         checkpoints = next(
             (p["checkpoints"] for p in bundle["contract"].get("predicates", [])
              if p["type"] == "P5"), [])
-        recovery = mode == "final"
+        recovery = False          # ★ 取消 first/final 后恒 False
         # ★ **seed 必须在签名里** —— 否则换 seed 会静默地无效。
         #
         #   `build_case_session()` 建的 adapter，其 backend factory 是
@@ -348,11 +314,10 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
         # `seq` 单调递增 —— **player 节点靠它判断「有新 episode 了」**（B4）。
         # 不用 `(case_id, seed)` 比对：同一个 seed 重跑是合法操作。
         #
-        # 顺带把 attempt 归零：attempt 只在**同一个 episode 内**有意义
-        # （`final` 最多 3 次 run）。`next_attempt()` 只推它，不推 `seq`。
+        # attempt 恒为 1（不再有追加执行）。
         self._episode_seq = int(getattr(self, "_episode_seq", 0)) + 1
         self._attempt_seq = 1
-        self._episode = {"case_id": case_id, "seed": seed, "mode": mode,
+        self._episode = {"case_id": case_id, "seed": seed,
                          "seq": self._episode_seq, "attempt": self._attempt_seq}
         # ★ **初态要在这里采**（见上）—— 但 `final` 的第 2/3 次 attempt
         #   用的是**同一份初态**（不 reset），所以 `_initial_*` 不再更新。
@@ -669,11 +634,8 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
 
         try:
             adapter = self._require_adapter()
-            if record.operation == "joint_control":
-                raw = adapter.step({
-                    "joint_position": list(record.arguments["joint_position"]),
-                    "gripper_opening_m": float(record.arguments["gripper_opening_m"]),
-                })
+            if record.operation == "trajectory_control":
+                raw = self._run_chunk_blocking(record, adapter)
             elif record.operation == "gripper_control":
                 raw = adapter.dispatch_public(
                     "piper_gripper_control",
@@ -682,7 +644,8 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
                 raise RuntimeError(f"no executor bound for {record.operation}")
 
             payload = {"control_steps": int(raw.get("control_steps", 0)),
-                       "sim_time_s": float(raw.get("simulation_time_s", 0.0))}
+                       "sim_time_s": float(raw.get("sim_time_s", 0.0)),
+                       "executed_steps": int(raw.get("executed_steps", 0))}
             schema_mod.validate_output(
                 _tool_id_for(record.endpoint_id, record.operation), payload)
             with record.lock:
@@ -697,12 +660,59 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
                 record.error_text = f"{type(exc).__name__}: {str(exc)[:200]}"
                 record.result = ToolResult(
                     status="failed", outputs={},
-                    error=ToolError(code="TRACK2_ACTION_FAILED",
+                    error=ToolError(code=self._error_code_for(exc),
                                     message=record.error_text, retryable=False))
                 record.phase = _PHASE_FAILED
                 record.execution_status = EXEC_STOPPED_CONFIRMED
                 record.finished_at_s = time.monotonic()
             self._emit_terminal(record, "executor_failed")
+
+    @staticmethod
+    def _error_code_for(exc: Exception) -> str:
+        """把执行体异常映射成 gateway 错误码。
+
+        ⚠️ **F1 修法**（2026-10-18）：`control budget exhausted` 以前和别的异常
+        一起走 `TRACK2_ACTION_FAILED` → 客户端 `ToolCallError` → `node.py` 的
+        `INFRASTRUCTURE_ERRORS` → `infrastructure_timeout` → **Gate BLOCKED**。
+        但「预算正常用满」是**可评分**的 `budget_timeout`，不是链路故障。
+        所以给它一个**专用错误码**，客户端据此单独映射。
+        """
+        if isinstance(exc, RuntimeError) and "control budget exhausted" in str(exc):
+            return "TRACK2_CONTROL_BUDGET_EXHAUSTED"
+        return "TRACK2_ACTION_FAILED"
+
+    def _run_chunk_blocking(self, record: "_Execution", adapter) -> dict:
+        """执行一段 Action Chunk（`targets`，8–25 步）。
+
+        **两阶段语义**（`plan/Track2_强制ActionChunk_契约设计.md` §4.1）：
+
+        1. **阶段 1：全链预校验** —— 限位 / 步间限幅 / 预算，**一步物理都不推进**。
+           整条不过就整条拒绝（原子性）。预算预校验是本改造**多出来的必需件**：
+           chunk 是唯一的移动途径，撞预算必须在**调用前**判掉，否则必然半途
+           停在 BLOCKED（F1）。
+        2. **阶段 2：逐步执行** —— 每步检查 `cancel_requested`，可打断。
+
+        ⚠️ chunk 内部**不重拍图**（帧仍挂在 `observe` 上）—— 它是一段盲走。
+        """
+        targets = record.arguments["targets"]
+        # ── 阶段 1
+        previous = adapter.current_command_target()
+        for item in targets:
+            previous = adapter.assert_within_slew(
+                previous, item["joint_position"], item["gripper_opening_m"])
+            previous = [*previous[0].tolist(), float(previous[1])]
+        adapter.assert_budget_allows(len(targets))
+        # ── 阶段 2
+        executed = 0
+        for item in targets:
+            if record.cancel_requested:
+                break
+            adapter.step({"joint_position": list(item["joint_position"]),
+                          "gripper_opening_m": float(item["gripper_opening_m"])})
+            executed += 1
+        return {"control_steps": executed,
+                "sim_time_s": executed * adapter.control_timestep,
+                "executed_steps": executed}
 
     def _emit_terminal(self, record: "_Execution", event_type: str) -> None:
         """把终态事件推给官方 handler —— **这是 phase 推进的唯一途径**。
@@ -849,7 +859,7 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
 # 所以在边界上显式映射，两边各自用自己惯用的标识。
 _TOOL_IDS = {
     ("track2.env", "observe"): "track2.env.observe",
-    ("track2.robot", "joint_control"): "track2.robot.joint_control",
+    ("track2.robot", "trajectory_control"): "track2.robot.joint_trajectory",
     ("track2.robot", "gripper_control"): "track2.robot.gripper_control",
 }
 

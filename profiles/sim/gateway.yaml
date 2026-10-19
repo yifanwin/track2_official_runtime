@@ -139,30 +139,41 @@ tools:
           frame: arm_base
           axis: x
           sign: 1
-  - tool_id: track2.robot.joint_control
+  - tool_id: track2.robot.joint_trajectory
     implementation_id: track2.runtime
     endpoint_id: track2.robot
-    operation: joint_control
+    operation: trajectory_control
     semantics: action
-    description: Command one joint position target plus gripper opening. The physical effect completes
-      when the Action terminates.
+    description: 'Execute an action chunk: a short pre-computed joint trajectory. This is the ONLY way
+      to move the arm. Each consecutive pair of targets must respect the per-step slew limit; the whole
+      chunk is validated first and rejected as a unit.'
     input_schema:
       type: object
       additionalProperties: false
       required:
-      - joint_position
-      - gripper_opening_m
+      - targets
       properties:
-        joint_position:
+        targets:
           type: array
+          minItems: 8
+          maxItems: 25
           items:
-            type: number
-          minItems: 6
-          maxItems: 6
-        gripper_opening_m:
-          type: number
-          minimum: 0
-          maximum: 0.1
+            type: object
+            additionalProperties: false
+            required:
+            - joint_position
+            - gripper_opening_m
+            properties:
+              joint_position:
+                type: array
+                items:
+                  type: number
+                minItems: 6
+                maxItems: 6
+              gripper_opening_m:
+                type: number
+                minimum: 0
+                maximum: 0.1
     output_schema:
       type: object
       additionalProperties: false
@@ -175,6 +186,9 @@ tools:
           minimum: 1
         sim_time_s:
           type: number
+        executed_steps:
+          type: integer
+          minimum: 0
     readiness: []
     robot_frame_profile: *id001
   - tool_id: track2.robot.gripper_control

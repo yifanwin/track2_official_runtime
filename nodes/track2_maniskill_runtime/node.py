@@ -92,7 +92,7 @@ OPERATIONS = {
                                 max_concurrency=1),
     ),
     "track2.robot": (
-        ToolOperationDescriptor(name="joint_control", semantics="action",
+        ToolOperationDescriptor(name="trajectory_control", semantics="action",
                                 cancellable=True, status_supported=True,
                                 max_concurrency=1),
         ToolOperationDescriptor(name="gripper_control", semantics="action",
