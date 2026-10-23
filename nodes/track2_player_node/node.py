@@ -119,7 +119,7 @@ class PlayerConfig:
         default_player = self.bundle_root / "profiles" / self.profile / "player"
         self.player_dir = Path(
             env.get("TRACK2_PLAYER_DIR") or default_player).expanduser()
-        self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 120)
+        self.timeout_s = float(env.get("TRACK2_PLAYER_TIMEOUT_S") or 300)
         self.tool_call_budget = int(env.get("TRACK2_TOOL_CALL_BUDGET") or 200)
         self.action_timeout_s = float(env.get("TRACK2_ACTION_TIMEOUT_S") or 5)
         # 等 gateway + provider 注册就绪的上限（建场景要几十秒）

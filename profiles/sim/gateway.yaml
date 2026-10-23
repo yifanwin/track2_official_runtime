@@ -33,8 +33,8 @@ tools:
     endpoint_id: track2.env
     operation: observe
     semantics: query
-    description: 'Read the approved current observation: robot proprioception, control clock, and the
-      policy camera frame when RGB is requested.'
+    description: 'Read the approved current observation: robot proprioception, control clock, and fixed
+      and wrist RGB camera frames when RGB is requested.'
     input_schema:
       type: object
       additionalProperties: false
@@ -100,7 +100,7 @@ tools:
           type: object
           additionalProperties: false
           properties:
-            camera:
+            camera: &id001
               type: object
               additionalProperties: false
               required:
@@ -128,8 +128,11 @@ tools:
                   type: string
             camera_status:
               type: string
+            wrist_camera: *id001
+            wrist_camera_status:
+              type: string
     readiness: []
-    robot_frame_profile: &id001
+    robot_frame_profile: &id002
       robot_id: piper
       base_frame: arm_base
       tool_frame: tcp
@@ -190,7 +193,7 @@ tools:
           type: integer
           minimum: 0
     readiness: []
-    robot_frame_profile: *id001
+    robot_frame_profile: *id002
   - tool_id: track2.robot.gripper_control
     implementation_id: track2.runtime
     endpoint_id: track2.robot
@@ -220,7 +223,7 @@ tools:
         sim_time_s:
           type: number
     readiness: []
-    robot_frame_profile: *id001
+    robot_frame_profile: *id002
 readiness:
   require_proprio_state: false
   require_images: false

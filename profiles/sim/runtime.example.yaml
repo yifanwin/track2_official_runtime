@@ -1,69 +1,18 @@
-# track2-maniskill-runtime 的配置。
-#
-# **case_id 与 seed 走环境变量**（`TRACK2_CASE_ID` / `TRACK2_SEED`），
-# 因为它们是**每个 case 的评测输入**，不该固化进 Bundle —— 否则换个 case
-# 就得重新打包。这里留的值只是**调试默认值**。
-#
-# 评测机注入方式（任选其一）：
-#   * `skill.yaml` 的 `profiles.<p>.environment`
-#   * 启动前 `export TRACK2_CASE_ID=xxx TRACK2_SEED=0`
-
+# Track2 Runtime 0.3.5 发布默认配置。
+# 正式入口逐次渲染 case、seed、GPU 和私有控制端口。
 case_id: 001_real_world_images__real_image_1
 seed: 0
-
-# 相对路径按 `TRACK2_PHYSICS_ROOT` 解析（不是按本文件所在目录）——
-# 因为 PAOS 的 installer 会把 profile 文件软链到另一个位置，
-# 从那里往上推是错的。绝对路径照常。
-casebank: judge_private/casebank      # 相对 TRACK2_PHYSICS_ROOT
-
-# episode 预算 —— 与评测器 runner 的语义一致
+casebank: judge_private/casebank
 max_steps: 400
 max_sim_time_s: 20.0
-
-# Action 治理（Q9 / Q12 / Q14）
-max_concurrency: 1              # Q9：关节控制天然串行
-action_timeout_s: 5.0           # Q14（2026-10-18）：73 例实测 p99 0.675 / max 0.940 s
-stop_confirm_timeout_s: 5.0     # Q13：「等 backend 确认真实停止」的上限
-
-# 观测（第 5 步 / 模式 B）
-# 相机默认**必需**：原始图文是选手唯一的感知来源，没相机这条链路不成立。
-# 诊断场景（只想量物理）可以设 false —— 那时不建相机、跑得更快。
+max_concurrency: 1
+action_timeout_s: 5.0
+stop_confirm_timeout_s: 5.0
 camera_required: true
-
-# 渲染用的物理 GPU 卡号（八卡并行）。空/0 = 原行为。
-#
-# `env_factory` 写死 `render_backend='sapien_cuda:0'`，而 `cuda:0` 是
-# 「`CUDA_VISIBLE_DEVICES` 里的第 0 个」。8 路并行时若不设，全部落回物理卡 0。
-# 裁判侧按 worker 渲染本项（w<k> → GPU k）。
-#
-# ⚠️ 走**配置**不走环境变量：`--detach` 下节点由长命 daemon spawn，
-#    daemon 环境里没有 `TRACK2*` —— 用环境变量会静默地不生效。
 render_gpu: "0"
-
-# 给选手的自然语言指令（公开输入之一，不含任何答案）
 text_instruction: "Move the target object to the position shown in the reference image."
-
-# provider 注册续租间隔（必须小于 gateway.yaml 的 lease_ttl_ms=15000）
 lease_renew_interval_s: 5.0
-
-# Judge-only 私有控制口（B1）。**0 = 关闭**（CPU 回归不开监听）。
-#
-# >0 时 runtime 节点在 loopback 上开一个只给裁判用的 HTTP 口：
-#   POST /episode/reset     换 episode（case/seed/mode）
-#   POST /episode/next_attempt  同一 episode 内追加一次 run()（final 的第 2/3 次）
-#   GET  /episode/snapshot  judge-only 真值（选手够不到 —— 沙箱无网络）
-#   GET  /episode/timings   本 flow 至今所有 Action 的耗时分布（Q14 数据源）
-#
-# ⚠️ 走**配置**而不是环境变量：`dora start --detach` 下节点由长命的
-#    dora daemon spawn，daemon 环境里没有评测时设的变量 —— 用环境变量
-#    会静默地不开控制口。裁判侧逐次渲染本文件，端口一定到得了。
+# 0 表示关闭。正式入口分配本次运行端口；不将历史端口打入发布包。
 judge_control_port: 0
-
-# 裁判侧 Oracle 的 GT 规划（G2）。**默认关** —— 普通评测不许开。
-#
-# 开着时 `_reset_blocking` 会在**它自己的 env** 上做一次 GT 规划
-# （规划只读 env、不写），把 payload 经公开输入的 `oracle_plan` 字段下发给
-# 沙箱里的 oracle skill。选手包拿不到它（白名单逐次构造）。
-#
-# ⚠️ 与 judge_control_port 同理：由裁判侧渲染本文件打开，不走环境变量。
+# 正式选手评测不启用裁判规划输入。
 oracle_planning: false

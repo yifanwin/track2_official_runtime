@@ -70,7 +70,9 @@ class RuntimeConfig:
     # `TRACK2*`。裁判侧按 worker 渲染本项。
     #
     # 语义：节点用它设 `CUDA_VISIBLE_DEVICES`，让 `sapien_cuda:0` 落在该卡。
-    # 空/0 = 不改变原行为。
+    # 空 = 不改变原行为；**`0` 是合法的显式卡号（物理卡 0）**。
+    # ⚠️ 别把 0 当 falsy 处理 —— YAML 里的 `render_gpu: 0` 是 int 0，
+    #    写成 `... or ""` 会让 w0 静默不生效（见 Node._build_adapter）。
     render_gpu: str = "0"
 
     # ── 裁判侧 Oracle 的 GT 规划（G2）

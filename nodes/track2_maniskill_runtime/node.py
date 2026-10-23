@@ -214,7 +214,13 @@ class RuntimeNode:
         #
         #   取值**走配置**（`runtime.yaml` 的 `render_gpu`）：`--detach` 下节点
         #   由长命 daemon spawn，daemon 环境里没有 `TRACK2*`。裁判侧按 worker 渲染。
-        _gpu = str(getattr(self.config, "render_gpu", "") or "").strip()
+        #
+        #   ⚠️ 不能写 `... or ""`：YAML 的 `render_gpu: 0` 解析成 **int 0**，
+        #   `0 or ""` ⇒ `""` ⇒ w0「未设置」⇒ 不重设被清空的
+        #   `CUDA_VISIBLE_DEVICES` ⇒ `failed to find device "cuda:0"`（实测，
+        #   8 路并行只有 w0 挂）。空串/None 才是「未设置」。
+        _raw_gpu = getattr(self.config, "render_gpu", None)
+        _gpu = "" if _raw_gpu is None else str(_raw_gpu).strip()
         _render_device = 'sapien_cuda:0' if _gpu else None
         if _gpu:
             os.environ["CUDA_VISIBLE_DEVICES"] = _gpu

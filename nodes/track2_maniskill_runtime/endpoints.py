@@ -853,7 +853,14 @@ class Track2SimulationEndpoints(QueryToolEndpoint, ActionToolEndpoint):
                 "operation": record.operation,
             }
             phase = record.phase
-        return ToolExecutionStatus(phase=phase, details=details)
+            # Official SPI requires error on failed/unknown terminal status.
+            # Preserve the original failure (including required camera failure)
+            # instead of raising a second exception while polling it.
+            error = record.result.error if record.result is not None else None
+            if phase in (_PHASE_FAILED, _PHASE_UNKNOWN) and error is None:
+                error = ToolError(code="TRACK2_ACTION_FAILED",
+                                  message="execution failed", retryable=False)
+        return ToolExecutionStatus(phase=phase, error=error, details=details)
 
     async def result(self, key: ToolExecutionKey) -> ToolResultResponse:
         record = self._executions.get(key.invocation_id)
@@ -998,6 +1005,10 @@ def _shape_observation(raw: dict, *, include_rgb: bool) -> dict:
             images["camera"] = raw["first_frame"]
         if raw.get("camera_status") is not None:
             images["camera_status"] = str(raw["camera_status"])
+        if raw.get("wrist_frame") is not None:
+            images["wrist_camera"] = raw["wrist_frame"]
+        if raw.get("wrist_camera_status") is not None:
+            images["wrist_camera_status"] = str(raw["wrist_camera_status"])
         if images:
             out["images"] = images
     return out
